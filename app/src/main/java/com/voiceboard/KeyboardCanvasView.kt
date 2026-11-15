@@ -107,6 +107,9 @@ class KeyboardCanvasView(context: Context) : View(context) {
     /** Number of points in all live swipe trails; exposed so the TTL can be tested. */
     internal fun activeTrailPointCount(): Int = trails.values.sumOf { it.size }
 
+    /** Number of keys still fading after release; exposed for the touch-feedback test. */
+    internal fun activePressFadeCount(): Int = pressFadeStarts.size
+
     /**
      * Bounds of the glyph exactly as [drawKey] would render it. Used by the typography test to
      * verify that lowercase and capital letters have the same visual width and height.
@@ -159,6 +162,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
 
     private val pointerHits = HashMap<Int, Hit>()
     private val pressedHits = HashSet<Hit>()
+    private val pressFadeStarts = HashMap<Hit, Long>()
+    private var pressFadeTickerRunning = false
     private val longPressTasks = HashMap<Int, Runnable>()
     private val longPressedPointers = HashSet<Int>()
     private val cancelledPointers = HashSet<Int>()
@@ -345,6 +350,30 @@ class KeyboardCanvasView(context: Context) : View(context) {
         }
     }
 
+    /**
+     * Drives the short light-to-gray fade after a key is released. Only released keys are tracked,
+     * so holding a key does not schedule frames.
+     */
+    private val pressFadeTicker = object : Runnable {
+        override fun run() {
+            if (pressFadeStarts.isEmpty()) {
+                pressFadeTickerRunning = false
+                return
+            }
+            val now = SystemClock.uptimeMillis()
+            val iterator = pressFadeStarts.entries.iterator()
+            while (iterator.hasNext()) {
+                if (now - iterator.next().value >= PRESS_FADE_MILLIS) iterator.remove()
+            }
+            invalidate()
+            if (pressFadeStarts.isNotEmpty()) {
+                handler.postDelayed(this, PRESS_FADE_FRAME_MILLIS)
+            } else {
+                pressFadeTickerRunning = false
+            }
+        }
+    }
+
     init {
         isFocusable = false
         setBackgroundColor(COLOR_BACKGROUND)
@@ -375,6 +404,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         pulse?.cancel()
         pulse = null
         stopTrailTicker()
+        stopPressFadeTicker()
         handler.removeCallbacksAndMessages(null)
         router.reset()
         cancelTouchState()
@@ -475,6 +505,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
         keyHits.clear()
         toolbarHits.clear()
         pressedHits.clear()
+        pressFadeStarts.clear()
+        stopPressFadeTicker()
 
         val side = dp(4f)
         val gap = dp(4f)
@@ -580,7 +612,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
             return
         }
         drawToolbar(canvas)
-        for (index in keyHits.indices) drawKey(canvas, keyHits[index])
+        val now = SystemClock.uptimeMillis()
+        for (index in keyHits.indices) drawKey(canvas, keyHits[index], now)
         drawSwipeTrails(canvas)
         drawPreview(canvas)
     }
@@ -715,16 +748,20 @@ class KeyboardCanvasView(context: Context) : View(context) {
         drawVoiceCancelGlyph(canvas)
     }
 
-    private fun drawKey(canvas: Canvas, hit: Hit) {
+    private fun drawKey(canvas: Canvas, hit: Hit, now: Long) {
         val key = hit.key
         val rect = hit.rect
         val background = when {
-            pressedHits.contains(hit) -> pressedPaint
             key.action == Action.SHIFT && caps -> capsPaint
             isFunctionKey(key) -> functionPaint
             else -> keyPaint
         }
         canvas.drawRoundRect(rect, dp(8f), dp(8f), background)
+        val pressAlpha = pressHighlightAlpha(hit, now)
+        if (pressAlpha > 0) {
+            pressedPaint.alpha = pressAlpha
+            canvas.drawRoundRect(rect, dp(8f), dp(8f), pressedPaint)
+        }
 
         val iconColor = if (key.action == Action.SHIFT && (shift || caps)) COLOR_ACCENT else COLOR_TEXT
         when (key.action) {
@@ -839,6 +876,32 @@ class KeyboardCanvasView(context: Context) : View(context) {
             top + stroke / 2f,
             beGlyphPaint
         )
+    }
+
+    private fun startPressFade(hit: Hit) {
+        if (pressedHits.contains(hit)) return
+        pressFadeStarts[hit] = SystemClock.uptimeMillis()
+        if (!pressFadeTickerRunning) {
+            pressFadeTickerRunning = true
+            handler.postDelayed(pressFadeTicker, PRESS_FADE_FRAME_MILLIS)
+        }
+        invalidate()
+    }
+
+    private fun stopPressFadeTicker() {
+        if (!pressFadeTickerRunning) return
+        pressFadeTickerRunning = false
+        handler.removeCallbacks(pressFadeTicker)
+    }
+
+    private fun pressHighlightAlpha(hit: Hit, now: Long): Int {
+        if (pressedHits.contains(hit)) return 255
+        val started = pressFadeStarts[hit] ?: return 0
+        val elapsed = now - started
+        if (elapsed >= PRESS_FADE_MILLIS) return 0
+        return ((1f - elapsed.toFloat() / PRESS_FADE_MILLIS) * 255f)
+            .toInt()
+            .coerceIn(0, 255)
     }
 
     private fun drawSwipeTrails(canvas: Canvas) {        val now = SystemClock.uptimeMillis()
@@ -1228,6 +1291,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         val hit = hitAt(x, y) ?: return
         pointerHits[id] = hit
         pressedHits.add(hit)
+        pressFadeStarts.remove(hit)
         listener?.onKeyDown(hit.key)
         if (hit.key.action == Action.SPACE) {
             spaceStartX[id] = x
@@ -1315,16 +1379,19 @@ class KeyboardCanvasView(context: Context) : View(context) {
             if (hit.key.action == Action.BACKSPACE) listener?.onKeyUp(hit.key)
             pressedHits.remove(hit)
             if (pointerHits.values.any { it === hit }) pressedHits.add(hit)
+            if (!pressedHits.contains(hit)) startPressFade(hit)
 
             if (hit.key.action == Action.SPACE) {
                 val startX = spaceStartX[id]
                 if (spaceDragging.remove(id)) {
                     if (startX != null) listener?.onSpaceDrag(x - startX)
                     listener?.onSpaceDragEnd()
-                } else if (!wasLongPressed && !wasCancelled && hit.rect.contains(x, y)) {
+                } else if (!wasLongPressed && !wasCancelled && hitAt(x, y) === hit) {
                     listener?.onKeyAction(hit.key)
                 }
-            } else if (!wasLongPressed && !wasCancelled && !isInstant(hit.key) && hit.rect.contains(x, y)) {
+            } else if (!wasLongPressed && !wasCancelled && !isInstant(hit.key) &&
+                hitAt(x, y) === hit
+            ) {
                 listener?.onKeyAction(hit.key)
             }
         }
@@ -1345,6 +1412,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
 
     private fun cancelTouchState() {
         stopTrailTicker()
+        stopPressFadeTicker()
+        pressFadeStarts.clear()
         for (task in longPressTasks.values) handler.removeCallbacks(task)
         longPressTasks.clear()
         for (hit in pointerHits.values) {
@@ -1412,7 +1481,41 @@ class KeyboardCanvasView(context: Context) : View(context) {
             val hit = keyHits[index]
             if (hit.rect.contains(x, y)) return hit
         }
-        return null
+        // Small gaps between keys used to swallow taps. Map a near-miss to the closest key so
+        // every point inside the key area has a target; the nearest key also wins at a gap centre.
+        if (keyHits.isEmpty()) return null
+        var keyTop = Float.MAX_VALUE
+        var keyBottom = -Float.MAX_VALUE
+        for (index in 0 until keyHits.size) {
+            val rect = keyHits[index].rect
+            if (rect.top < keyTop) keyTop = rect.top
+            if (rect.bottom > keyBottom) keyBottom = rect.bottom
+        }
+        if (y < keyTop - dp(2f) || y > keyBottom + dp(2f)) return null
+
+        val maxDistance = dp(6f)
+        val maxSquared = maxDistance * maxDistance
+        var best: Hit? = null
+        var bestSquared = Float.MAX_VALUE
+        for (index in 0 until keyHits.size) {
+            val rect = keyHits[index].rect
+            val dx = when {
+                x < rect.left -> rect.left - x
+                x > rect.right -> x - rect.right
+                else -> 0f
+            }
+            val dy = when {
+                y < rect.top -> rect.top - y
+                y > rect.bottom -> y - rect.bottom
+                else -> 0f
+            }
+            val squared = dx * dx + dy * dy
+            if (squared < bestSquared) {
+                bestSquared = squared
+                best = keyHits[index]
+            }
+        }
+        return if (best != null && bestSquared <= maxSquared) best else null
     }
 
     private fun suggestionIndexAt(x: Float, y: Float): Int {
@@ -1674,13 +1777,15 @@ class KeyboardCanvasView(context: Context) : View(context) {
         const val TRAIL_TTL_MILLIS = 250L
         const val TRAIL_FRAME_MILLIS = 16L
         const val TRAIL_FADE_MILLIS = 220L
+        const val PRESS_FADE_MILLIS = 180L
+        const val PRESS_FADE_FRAME_MILLIS = 16L
         // Lower and upper case share one text size; Shift only changes case and weight.
         const val LETTER_TEXT_SIZE_DP = 24.5f
 
         val COLOR_BACKGROUND = Color.rgb(28, 28, 30)
         val COLOR_KEY = Color.rgb(44, 44, 46)
         val COLOR_FUNCTION = Color.rgb(36, 36, 38)
-        val COLOR_PRESSED = Color.rgb(58, 58, 60)
+        val COLOR_PRESSED = Color.rgb(78, 78, 82)
         val COLOR_CAPS = Color.rgb(58, 58, 60)
         val COLOR_TEXT = Color.rgb(245, 245, 247)
         val COLOR_SECONDARY = Color.rgb(142, 142, 147)

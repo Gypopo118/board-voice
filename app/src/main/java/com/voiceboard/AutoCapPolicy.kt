@@ -22,4 +22,14 @@ object AutoCapPolicy {
 
     fun endsSentence(mark: String): Boolean =
         mark.length == 1 && mark[0] in SENTENCE_END
+
+    /**
+     * After Backspace the cursor may return to the start of a word, sentence or line. In those
+     * positions the next letter must be capitalised again, even though the previous Shift state
+     * was already consumed by the deleted letter.
+     */
+    fun shouldCapitalizeAfterDeletion(beforeCursor: String?): Boolean {
+        val last = beforeCursor?.lastOrNull() ?: return true
+        return last == '\n' || endsSentence(last.toString())
+    }
 }

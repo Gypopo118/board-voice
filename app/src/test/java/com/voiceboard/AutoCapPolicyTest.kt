@@ -76,4 +76,17 @@ class AutoCapPolicyTest {
         assertFalse(AutoCapPolicy.endsSentence(".."))
         assertFalse(AutoCapPolicy.endsSentence(""))
     }
+
+    @Test
+    fun deletionReturnsShiftAtFieldStartAndSentenceBoundaries() {
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion(null))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion(""))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("."))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("!"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("?"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("\n"))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfterDeletion("а"))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfterDeletion(" "))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfterDeletion(","))
+    }
 }

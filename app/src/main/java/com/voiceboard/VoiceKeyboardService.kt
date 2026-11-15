@@ -549,7 +549,17 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         }
         clearWordState()
         spacing.reset()
-        if (currentInputConnection?.getTextBeforeCursor(1, 0).isNullOrEmpty()) enableAutoShift()
+        refreshAutoShiftAfterDeletion()
+    }
+
+    /**
+     * Backspace can return the cursor to an empty field, a new line or the end of a sentence.
+     * The Shift that produced the deleted capital was consumed, so the next letter needs it again.
+     */
+    private fun refreshAutoShiftAfterDeletion() {
+        if (caps) return
+        val before = currentInputConnection?.getTextBeforeCursor(1, 0)?.toString()
+        if (AutoCapPolicy.shouldCapitalizeAfterDeletion(before)) enableAutoShift()
     }
 
     private fun deleteOnce() {
@@ -558,6 +568,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         if (!connection.getSelectedText(0).isNullOrEmpty()) {
             connection.commitText("", 1)
             refreshWord()
+            refreshAutoShiftAfterDeletion()
             return
         }
         if (deleteSwipeWordIfAny(connection)) return
@@ -565,6 +576,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         val count = if (before.length == 2 && Character.isSurrogatePair(before[0], before[1])) 2 else 1
         connection.deleteSurroundingText(count, 0)
         refreshWord()
+        refreshAutoShiftAfterDeletion()
     }
 
     /**
@@ -584,6 +596,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         connection.deleteSurroundingText(count, 0)
         clearWordState()
         refreshWord()
+        refreshAutoShiftAfterDeletion()
         return true
     }
 
@@ -593,6 +606,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         if (!connection.getSelectedText(0).isNullOrEmpty()) {
             connection.commitText("", 1)
             refreshWord()
+            refreshAutoShiftAfterDeletion()
             return
         }
         val before = connection.getTextBeforeCursor(64, 0)?.toString().orEmpty()
@@ -600,6 +614,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         val count = TRAILING_WORD.find(before)?.value?.length ?: 1
         connection.deleteSurroundingText(count, 0)
         refreshWord()
+        refreshAutoShiftAfterDeletion()
     }
 
     private fun commitSecondary(key: KeyboardCanvasView.Key) {

@@ -232,6 +232,66 @@ class KeyboardCanvasRenderTest {
     }
 
     @Test
+    fun rapidSequentialTapsAreAllDelivered() {
+        val view = createView()
+        val log = mutableListOf<String>()
+        view.listener = RecordingListener(log)
+        val letters = listOf("Й", "Ц", "У", "К", "Е", "Н")
+
+        for (letter in letters) {
+            val hit = key(view, letter)
+            tap(view, hit.center.x, hit.center.y)
+        }
+
+        assertEquals(letters.map { "down:$it" }, log)
+    }
+
+    @Test
+    fun gapBetweenKeysMapsToNearestKey() {
+        val view = createView()
+        val log = mutableListOf<String>()
+        view.listener = RecordingListener(log)
+        val left = key(view, "Й")
+        val right = key(view, "Ц")
+        val gapX = (left.rect.right + right.rect.left) / 2f
+
+        tap(view, gapX, left.center.y)
+
+        assertEquals(1, log.size)
+        assertTrue(log.first().startsWith("down:"))
+    }
+
+    @Test
+    fun gapTapStillFiresADeferredKey() {
+        val view = createView()
+        val log = mutableListOf<String>()
+        view.listener = RecordingListener(log)
+        val space = view.keyMap.first { it.key.action == KeyboardCanvasView.Action.SPACE }
+        val period = key(view, ".")
+        val gapX = space.rect.right + (period.rect.left - space.rect.right) * 0.25f
+
+        tap(view, gapX, space.center.y)
+
+        assertTrue("space action not delivered: $log", log.contains("action:" + space.key.label))
+    }
+
+    @Test
+    fun keyHighlightFadesAfterRelease() {
+        val view = createView()
+        val log = mutableListOf<String>()
+        view.listener = RecordingListener(log)
+        val hit = key(view, "Й")
+
+        tap(view, hit.center.x, hit.center.y)
+        assertTrue(view.activePressFadeCount() > 0)
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(80))
+        draw(view, "keyboard-press-fade")
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(250))
+        assertEquals(0, view.activePressFadeCount())
+    }
+
+    @Test
     fun swipeDoesNotStartOnSymbolsOrWhenDisabled() {
         val symbolView = createView()
         val symbolLog = mutableListOf<String>()
