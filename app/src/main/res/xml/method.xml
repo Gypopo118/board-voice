@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<input-method xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="com.voiceboard.SettingsActivity"
+    android:supportsSwitchingToNextInputMethod="true">
+    <subtype
+        android:label="@string/ime_label"
+        android:imeSubtypeMode="keyboard"
+        android:imeSubtypeLocale="ru_RU"
+        android:isAsciiCapable="false" />
+</input-method>

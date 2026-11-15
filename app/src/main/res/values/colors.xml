@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The keyboard palette is defined in KeyboardCanvasView; only the launcher needs a resource. -->
+    <color name="ic_launcher_background">#FF14161F</color>
+</resources>
