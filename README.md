@@ -165,7 +165,7 @@ git remote add origin https://github.com/<логин>/<репозиторий>.g
 git push -u origin main
 ```
 
-Готовый APK — во вкладке **Actions → последний запуск → Artifacts → VoiceBoard-apk**.
+Готовый APK — во вкладке **Actions → последний запуск → Artifacts → board-voice-apk**.
 
 Чтобы получить APK ещё и в разделе Releases, пушните тег:
 
