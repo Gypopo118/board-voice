@@ -239,6 +239,12 @@ class KeyboardCanvasView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         isSubpixelText = true
     }
+    private val beGlyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = COLOR_TEXT
+    }
     /**
      * Fixed metrics used to place every letter on the same baseline. Bold and regular glyphs can
      * report slightly different font metrics, which would otherwise shift the Shift mode letters.
@@ -281,6 +287,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         isSubpixelText = true
     }
     private val lowercaseWidthScales = HashMap<Char, Float>(40)
+    private val beCapHeight: Float by lazy { letterDrawBounds(true, 'б').height() }
     private val suggestionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = COLOR_TEXT
         textAlign = Paint.Align.CENTER
@@ -776,7 +783,11 @@ class KeyboardCanvasView(context: Context) : View(context) {
                     } else {
                         rect.centerX()
                     }
-                    canvas.drawText(label, labelX, labelBaseline, keyTextPaint)
+                    if (letterKey && !upperMode && label == "б") {
+                        drawLowTopBe(canvas, labelX, labelBaseline, rect)
+                    } else {
+                        canvas.drawText(label, labelX, labelBaseline, keyTextPaint)
+                    }
                 }
             }
         }
@@ -799,8 +810,38 @@ class KeyboardCanvasView(context: Context) : View(context) {
         handler.removeCallbacks(trailTicker)
     }
 
-    private fun drawSwipeTrails(canvas: Canvas) {
-        val now = SystemClock.uptimeMillis()
+    /**
+     * Lowercase `б` in the system font has a tall curved ascender that reaches the superscript
+     * `?` in the top-right corner of the key. This variant keeps the font's bowl/stem, clips the
+     * part above the cap line and replaces the hook with a low horizontal top stroke. Only this
+     * one Russian key uses it; all other letters stay on the normal font.
+     */
+    private fun drawLowTopBe(canvas: Canvas, centerX: Float, baseline: Float, keyRect: RectF) {
+        val textWidth = keyTextPaint.measureText("б")
+        if (textWidth <= 0f) return
+        val top = baseline - beCapHeight
+        val left = centerX - textWidth / 2f
+        val right = centerX + textWidth / 2f
+
+        canvas.save()
+        canvas.clipRect(keyRect.left, top, keyRect.right, keyRect.bottom)
+        canvas.drawText("б", centerX, baseline, keyTextPaint)
+        canvas.restore()
+
+        val stroke = dp(2f)
+        beGlyphPaint.color = keyTextPaint.color
+        beGlyphPaint.strokeWidth = stroke
+        val stemX = left + textWidth * 0.10f
+        canvas.drawLine(
+            stemX,
+            top + stroke / 2f,
+            right - stroke / 2f,
+            top + stroke / 2f,
+            beGlyphPaint
+        )
+    }
+
+    private fun drawSwipeTrails(canvas: Canvas) {        val now = SystemClock.uptimeMillis()
         for (trail in trails.values) drawTrail(canvas, trail, now)
         for (trail in fadingTrails) drawTrail(canvas, trail, now)
     }
