@@ -11,6 +11,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PointF
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Handler
@@ -26,6 +27,7 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * One canvas owns rendering, hit-testing and every raw touch stream.
@@ -104,6 +106,26 @@ class KeyboardCanvasView(context: Context) : View(context) {
 
     /** Number of points in all live swipe trails; exposed so the TTL can be tested. */
     internal fun activeTrailPointCount(): Int = trails.values.sumOf { it.size }
+
+    /**
+     * Bounds of the glyph exactly as [drawKey] would render it. Used by the typography test to
+     * verify that lowercase and capital letters have the same visual width and height.
+     */
+    internal fun letterDrawBounds(upperMode: Boolean, letter: Char): RectF {
+        val paint = Paint(keyTextPaint)
+        paint.textSize = if (upperMode) letterMetricsPaint.textSize else lowercaseLetterTextSize
+        paint.textScaleX = if (upperMode) 1f else lowercaseWidthScale(letter)
+        paint.typeface = if (upperMode) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        val text = if (upperMode) letter.uppercaseChar().toString() else letter.lowercaseChar().toString()
+        val bounds = Rect()
+        paint.getTextBounds(text, 0, text.length, bounds)
+        return RectF(
+            bounds.left.toFloat(),
+            bounds.top.toFloat(),
+            bounds.right.toFloat(),
+            bounds.bottom.toFloat()
+        )
+    }
 
     var voiceActive = false
         set(value) {
@@ -226,6 +248,39 @@ class KeyboardCanvasView(context: Context) : View(context) {
         textSize = dp(LETTER_TEXT_SIZE_DP)
         isSubpixelText = true
     }
+
+    /**
+     * At the same text size lowercase glyphs have a much smaller x-height than capitals. The user
+     * asked for equal visual dimensions, so lowercase keeps its own shape but is scaled up until
+     * its x-height matches the cap height. The factor is measured from the actual system font.
+     */
+    private val lowercaseLetterScale: Float = run {
+        val probe = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            typeface = Typeface.DEFAULT
+            textSize = 100f
+            isSubpixelText = true
+        }
+        val capitalBounds = Rect()
+        val lowercaseBounds = Rect()
+        probe.typeface = Typeface.DEFAULT_BOLD
+        probe.getTextBounds("О", 0, 1, capitalBounds)
+        probe.typeface = Typeface.DEFAULT
+        probe.getTextBounds("о", 0, 1, lowercaseBounds)
+        if (lowercaseBounds.height() <= 0) {
+            1f
+        } else {
+            (capitalBounds.height().toFloat() / lowercaseBounds.height())
+                .coerceIn(1f, 1.6f)
+        }
+    }
+    private val lowercaseLetterTextSize: Float =
+        letterMetricsPaint.textSize * lowercaseLetterScale
+
+    private val letterProbePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.DEFAULT
+        isSubpixelText = true
+    }
+    private val lowercaseWidthScales = HashMap<Char, Float>(40)
     private val suggestionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = COLOR_TEXT
         textAlign = Paint.Align.CENTER
@@ -673,6 +728,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
             else -> {
                 val letterKey = key.action == Action.LETTER &&
                     key.label.length == 1 && key.label[0].isLetter()
+                val digitKey = key.action == Action.LETTER &&
+                    key.label.length == 1 && key.label[0].isDigit()
                 val upperMode = shift || caps
                 val label = when {
                     letterKey && upperMode -> key.upperLabel
@@ -683,11 +740,21 @@ class KeyboardCanvasView(context: Context) : View(context) {
                     keyTextPaint.textAlign = Paint.Align.CENTER
                     keyTextPaint.color = if (key.action == Action.SPACE) COLOR_MUTED else COLOR_TEXT
                     val labelBaseline: Float
-                    if (letterKey) {
-                        // Lower and upper case deliberately share one text size; only the weight
-                        // distinguishes the normal state from Shift/Caps Lock.
-                        keyTextPaint.textSize = dp(LETTER_TEXT_SIZE_DP)
-                        keyTextPaint.typeface = if (upperMode) {
+                    if (letterKey || digitKey) {
+                        // Capitals use the nominal size; lowercase is scaled to the same visual
+                        // height (x-height = cap height) while keeping its own glyph shape. Digits
+                        // share the capital size so the keyboard has one visual type scale.
+                        keyTextPaint.textSize = if (letterKey && !upperMode) {
+                            lowercaseLetterTextSize
+                        } else {
+                            letterMetricsPaint.textSize
+                        }
+                        keyTextPaint.textScaleX = if (letterKey && !upperMode) {
+                            lowercaseWidthScale(label[0])
+                        } else {
+                            1f
+                        }
+                        keyTextPaint.typeface = if (letterKey && upperMode) {
                             Typeface.DEFAULT_BOLD
                         } else {
                             Typeface.DEFAULT
@@ -695,6 +762,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
                         labelBaseline = letterBaseline(rect.centerY())
                     } else {
                         keyTextPaint.typeface = Typeface.DEFAULT
+                        keyTextPaint.textScaleX = 1f
                         keyTextPaint.textSize = when {
                             key.action == Action.SPACE -> dp(15f)
                             key.label.length > 2 -> dp(13f)
@@ -745,7 +813,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
             val fraction = (index + 1f) / count
             val ageAlpha = trail.ageAlpha(index, now)
             if (ageAlpha <= 0.01f) continue
-            val alpha = ((18f + 160f * fraction) * trail.alpha * ageAlpha)
+            val alpha = ((35f + 180f * fraction) * trail.alpha * ageAlpha)
                 .toInt()
                 .coerceIn(0, 255)
             trailGlowPaint.color = Color.argb((alpha * 0.28f).toInt(), 255, 107, 0)
@@ -1454,6 +1522,31 @@ class KeyboardCanvasView(context: Context) : View(context) {
         return centerY - (metrics.ascent + metrics.descent) / 2f
     }
 
+    /**
+     * Horizontal correction per lowercase glyph: the scaled lowercase keeps its own shape, but its
+     * bounding width is matched to the bold capital of the same letter. Results are cached because
+     * this runs during onDraw.
+     */
+    private fun lowercaseWidthScale(letter: Char): Float {
+        lowercaseWidthScales[letter]?.let { return it }
+        val capital = letter.uppercaseChar()
+        val capitalBounds = Rect()
+        val lowercaseBounds = Rect()
+        letterProbePaint.typeface = Typeface.DEFAULT_BOLD
+        letterProbePaint.textSize = letterMetricsPaint.textSize
+        letterProbePaint.getTextBounds(capital.toString(), 0, 1, capitalBounds)
+        letterProbePaint.typeface = Typeface.DEFAULT
+        letterProbePaint.textSize = lowercaseLetterTextSize
+        letterProbePaint.getTextBounds(letter.toString(), 0, 1, lowercaseBounds)
+        val scale = if (lowercaseBounds.width() <= 0) {
+            1f
+        } else {
+            (capitalBounds.width().toFloat() / lowercaseBounds.width()).coerceIn(0.8f, 1.25f)
+        }
+        lowercaseWidthScales[letter] = scale
+        return scale
+    }
+
     private fun dp(value: Float): Float = value * resources.displayMetrics.density
 
     private class SwipeTrail {
@@ -1511,7 +1604,10 @@ class KeyboardCanvasView(context: Context) : View(context) {
         fun ageAlpha(index: Int, now: Long): Float {
             if (index < 0 || index >= size) return 0f
             val age = (now - times[index]).coerceAtLeast(0L)
-            return (1f - age.toFloat() / TRAIL_TTL_MILLIS).coerceIn(0f, 1f)
+            val ratio = (age.toFloat() / TRAIL_TTL_MILLIS).coerceIn(0f, 1f)
+            // sqrt keeps the older part of the tail visible much longer than a linear fade,
+            // which previously made the whole trail look like it vanished instantly.
+            return sqrt(1f - ratio)
         }
     }
 
@@ -1533,10 +1629,10 @@ class KeyboardCanvasView(context: Context) : View(context) {
         const val CLIPBOARD_ROW_STEP_DP = 46f
         const val CLIPBOARD_ROW_HEIGHT_DP = 40f
         const val LONG_PRESS_MILLIS = 330L
-        const val MAX_TRAIL_POINTS = 128
-        const val TRAIL_TTL_MILLIS = 200L
+        const val MAX_TRAIL_POINTS = 160
+        const val TRAIL_TTL_MILLIS = 250L
         const val TRAIL_FRAME_MILLIS = 16L
-        const val TRAIL_FADE_MILLIS = 180L
+        const val TRAIL_FADE_MILLIS = 220L
         // Lower and upper case share one text size; Shift only changes case and weight.
         const val LETTER_TEXT_SIZE_DP = 24.5f
 

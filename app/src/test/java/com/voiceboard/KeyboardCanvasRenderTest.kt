@@ -181,7 +181,7 @@ class KeyboardCanvasRenderTest {
         move(view, next.center.x, next.center.y)
         assertTrue(view.activeTrailPointCount() > 0)
 
-        // TTL is ~200 ms; while the finger is still down the old tail must disappear.
+        // TTL is 250 ms; while the finger is still down the old tail must disappear.
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(350))
         assertEquals(0, view.activeTrailPointCount())
 
@@ -204,6 +204,31 @@ class KeyboardCanvasRenderTest {
         assertEquals(gesture.pointCount, gesture.times.size)
         assertTrue(gesture.hasTiming)
         assertTrue(gesture.durationMillis() >= 0L)
+    }
+
+    @Test
+    fun lowercaseAndCapitalGlyphsShareVisualBounds() {
+        val view = createView()
+        for (letter in listOf('о', 'а', 'м')) {
+            val lowercase = view.letterDrawBounds(false, letter)
+            val capital = view.letterDrawBounds(true, letter)
+            println(
+                "glyph $letter: capital ${capital.width()}x${capital.height()}, " +
+                    "lowercase ${lowercase.width()}x${lowercase.height()}"
+            )
+            assertEquals(
+                "height of $letter",
+                capital.height(),
+                lowercase.height(),
+                3f
+            )
+            assertEquals(
+                "width of $letter",
+                capital.width(),
+                lowercase.width(),
+                3f
+            )
+        }
     }
 
     @Test

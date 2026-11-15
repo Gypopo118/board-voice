@@ -45,6 +45,9 @@ class AutoSpacingManager(private val editor: Editor) {
     private var editingDepth = 0
     private var lastEditNanos = 0L
 
+    /** Last sticky mark, used to distinguish a sentence end from `10,5`, `14:30`, `v1.2`. */
+    private var lastStickyMark: Char? = null
+
     /**
      * Cursor movement produced by our own commits/deletions that the editor has not reported yet.
      * Selection updates cross the IME/editor process boundary asynchronously, so matching this
@@ -61,6 +64,7 @@ class AutoSpacingManager(private val editor: Editor) {
         state = SpaceState.NONE
         pendingCursorDelta = 0
         lastEditNanos = 0L
+        lastStickyMark = null
     }
 
     fun commitWord(word: String): WordInsertion = edit {
@@ -92,15 +96,18 @@ class AutoSpacingManager(private val editor: Editor) {
         if (!enabled) {
             write(mark)
             state = SpaceState.NONE
+            lastStickyMark = null
         } else if (editor.hasSelection()) {
             write(mark)
             state = SpaceState.PHANTOM
+            lastStickyMark = mark.firstOrNull()
         } else {
             if ((state == SpaceState.WEAK || dropLeadingSpace) && previousChar() == ' ') {
                 erase(1)
             }
             write(mark)
             state = SpaceState.PHANTOM
+            lastStickyMark = mark.firstOrNull()
         }
     }
 
@@ -109,6 +116,7 @@ class AutoSpacingManager(private val editor: Editor) {
         if (!enabled || editor.hasSelection()) {
             write(mark)
             state = SpaceState.NONE
+            lastStickyMark = null
         } else {
             val previous = previousChar()
             val leading = previous != null &&
@@ -119,12 +127,14 @@ class AutoSpacingManager(private val editor: Editor) {
                     previous in CLOSING_PUNCTUATION)
             write(if (leading) " $mark" else mark)
             state = SpaceState.NONE
+            lastStickyMark = null
         }
     }
 
     /**
-     * Typing a single character. PHANTOM becomes a real space unless it was left by punctuation,
-     * which keeps `14:30`, `10,5`, `v1.2` and `site.ru` intact.
+     * Typing a single character. PHANTOM becomes a real space before a new letter, including after
+     * sentence-ending `. ! ?`; after comma/colon it stays attached, and a following digit is never
+     * separated, which keeps `14:30`, `10,5` and `v1.2` intact.
      *
      * @return true when a space was inserted before [text].
      */
@@ -133,16 +143,23 @@ class AutoSpacingManager(private val editor: Editor) {
         if (!enabled || editor.hasSelection()) {
             write(text)
             state = SpaceState.NONE
+            lastStickyMark = null
             return@edit false
         }
         val previous = previousChar()
-        val leading = state == SpaceState.PHANTOM &&
-            previous != null &&
-            !previous.isWhitespace() &&
-            previous !in OPENING_PUNCTUATION &&
-            !isPunctuation(previous)
+        val sentenceBreak = state == SpaceState.PHANTOM &&
+            lastStickyMark in SENTENCE_END &&
+            text.firstOrNull()?.isLetter() == true
+        val leading = sentenceBreak || (
+            state == SpaceState.PHANTOM &&
+                previous != null &&
+                !previous.isWhitespace() &&
+                previous !in OPENING_PUNCTUATION &&
+                !isPunctuation(previous)
+            )
         write(if (leading) " $text" else text)
         state = SpaceState.NONE
+        lastStickyMark = null
         leading
     }
 
@@ -150,6 +167,7 @@ class AutoSpacingManager(private val editor: Editor) {
     fun commitSeparator(text: String) = edit {
         write(text)
         state = SpaceState.NONE
+        lastStickyMark = null
     }
 
     /** A manual space; a second consecutive manual space is no longer "weak". */
@@ -163,12 +181,14 @@ class AutoSpacingManager(private val editor: Editor) {
                 SpaceState.WEAK -> SpaceState.NONE
             }
         }
+        lastStickyMark = null
     }
 
     /** Pasted/transcribed text: commit verbatim and start a fresh spacing sequence. */
     fun commitRaw(text: String) = edit {
         write(text)
         state = SpaceState.NONE
+        lastStickyMark = null
     }
 
     fun onBackspace() {
@@ -226,6 +246,7 @@ class AutoSpacingManager(private val editor: Editor) {
         if (!enabled || editor.hasSelection()) {
             write(word)
             state = if (enabled) SpaceState.PHANTOM else SpaceState.NONE
+            lastStickyMark = null
             return WordInsertion(false)
         }
         val previous = previousChar()
@@ -237,6 +258,7 @@ class AutoSpacingManager(private val editor: Editor) {
                 previous in CLOSING_PUNCTUATION)
         write(if (leading) " $word" else word)
         state = SpaceState.PHANTOM
+        lastStickyMark = null
         return WordInsertion(leading)
     }
 
@@ -259,6 +281,7 @@ class AutoSpacingManager(private val editor: Editor) {
         private val OPENING_PUNCTUATION = setOf('(', '[', '{', '«')
         private val CLOSING_PUNCTUATION = setOf(')', ']', '}', '»')
         private val WORD_SEPARATORS = setOf('-', '@', '_', '/', '\\')
+        private val SENTENCE_END = setOf('.', '!', '?')
 
         private const val SELECTION_SETTLE_NANOS = 150_000_000L
 

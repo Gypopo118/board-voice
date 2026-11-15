@@ -125,6 +125,41 @@ class AutoSpacingManagerTest {
     }
 
     @Test
+    fun typedLetterAfterSentenceMarkGetsASpace() {
+        spacing.commitWord("слово")
+        spacing.commitStickyPunctuation(".")
+        assertState(AutoSpacingManager.SpaceState.PHANTOM)
+
+        val inserted = spacing.commitTyped("П")
+
+        assertTrue(inserted)
+        assertEquals("слово. П", editor.text)
+        assertState(AutoSpacingManager.SpaceState.NONE)
+    }
+
+    @Test
+    fun typedLetterAfterQuestionOrExclamationGetsASpace() {
+        spacing.commitWord("слово")
+        spacing.commitStickyPunctuation("?")
+        spacing.commitTyped("П")
+        spacing.commitStickyPunctuation("!")
+        spacing.commitTyped("Д")
+
+        assertEquals("слово? П! Д", editor.text)
+    }
+
+    @Test
+    fun typedDigitAfterSentenceMarkStaysAttached() {
+        spacing.commitWord("version")
+        spacing.commitStickyPunctuation(".")
+
+        val inserted = spacing.commitTyped("2")
+
+        assertFalse(inserted)
+        assertEquals("version.2", editor.text)
+    }
+
+    @Test
     fun openingAtTheStartOfTheFieldHasNoLeadingSpace() {
         spacing.commitOpening("(")
         type("текст")
