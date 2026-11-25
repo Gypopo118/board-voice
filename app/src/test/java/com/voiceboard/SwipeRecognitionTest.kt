@@ -91,6 +91,25 @@ class SwipeRecognitionTest {
     }
 
     @Test
+    fun recognizesHyphenatedWords() {
+        val engine = loadEngine()
+        val layout = layout(true)
+        val lexicon = engine.swipeLexicon(true)!!
+        val decoder = SwipeEngine()
+        val words = listOf(
+            "что-то", "кто-то", "где-то", "как-то", "почему-то",
+            "как-нибудь", "из-за", "всё-таки", "санкт-петербург"
+        )
+        for ((index, word) in words.withIndex()) {
+            val gesture = noisyPathFor(word, layout, 3000 + index)
+            val results = decoder.decode(gesture, layout, lexicon, 3)
+            val rendered = results.map { it.word }
+            println("HYPHEN RU $word -> $rendered")
+            assertTrue("$word not in top3: $rendered", rendered.contains(word))
+        }
+    }
+
+    @Test
     fun noisyRussianPathsStayInTopThree() {
         val engine = loadEngine()
         val layout = layout(true)
@@ -220,6 +239,8 @@ class SwipeRecognitionTest {
         val centers = ArrayList<PointF>()
         var previous = '\u0000'
         for (raw in word.lowercase()) {
+            // A hyphen has no key: the finger continues from one component to the next.
+            if (raw == '-') continue
             var letter = raw
             if (layout.russian && letter == 'ё') letter = 'е'
             if (letter == previous) continue

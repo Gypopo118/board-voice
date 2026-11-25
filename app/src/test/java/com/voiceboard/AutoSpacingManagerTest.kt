@@ -114,14 +114,51 @@ class AutoSpacingManagerTest {
     }
 
     @Test
-    fun typedLetterAfterPunctuationDoesNotGetASpace() {
+    fun typedLetterAfterCommaGetsASpace() {
         spacing.commitWord("слово")
         spacing.commitStickyPunctuation(",")
 
         val inserted = spacing.commitTyped("п")
 
-        assertFalse(inserted)
-        assertEquals("слово,п", editor.text)
+        assertTrue(inserted)
+        assertEquals("слово, п", editor.text)
+    }
+
+    @Test
+    fun typedLetterAfterColonOrSemicolonGetsASpace() {
+        type("слово")
+        spacing.commitStickyPunctuation(":")
+        assertTrue(spacing.commitTyped("п"))
+        assertEquals("слово: п", editor.text)
+
+        spacing.commitStickyPunctuation(";")
+        assertTrue(spacing.commitTyped("с"))
+        assertEquals("слово: п; с", editor.text)
+    }
+
+    @Test
+    fun abbreviationDotsStayInsideTheAbbreviation() {
+        type("т")
+        spacing.commitStickyPunctuation(".")
+        assertFalse(spacing.commitTyped("д"))
+        spacing.commitStickyPunctuation(".")
+        assertTrue(spacing.commitTyped("с"))
+
+        assertEquals("т.д. с", editor.text)
+    }
+
+    @Test
+    fun typedLetterAfterClosingBracketGetsASpace() {
+        type("слово")
+        spacing.commitSpace()
+        spacing.commitOpening("(")
+        type("текст")
+        spacing.commitStickyPunctuation(")")
+
+        val inserted = spacing.commitTyped("д")
+
+        assertTrue(inserted)
+        assertEquals("слово (текст) д", editor.text)
     }
 
     @Test
@@ -157,6 +194,17 @@ class AutoSpacingManagerTest {
 
         assertFalse(inserted)
         assertEquals("version.2", editor.text)
+    }
+
+    @Test
+    fun typedDigitAfterQuestionMarkGetsASpace() {
+        type("сколько")
+        spacing.commitStickyPunctuation("?")
+
+        val inserted = spacing.commitTyped("5")
+
+        assertTrue(inserted)
+        assertEquals("сколько? 5", editor.text)
     }
 
     @Test
@@ -240,6 +288,29 @@ class AutoSpacingManagerTest {
     }
 
     @Test
+    fun swipeAfterLetterTypingGetsASpaceWithoutPhantomState() {
+        type("слово")
+        assertState(AutoSpacingManager.SpaceState.NONE)
+
+        val beforeStarter = spacing.state
+        spacing.commitTyped("м")
+        spacing.replaceWord(1, "мир", beforeStarter)
+
+        assertEquals("слово мир", editor.text)
+        assertFalse(editor.text.contains("  "))
+    }
+
+    @Test
+    fun wholeWordCommitSeparatesFromTypedLetters() {
+        type("слово")
+
+        spacing.commitWord("мир")
+
+        assertEquals("слово мир", editor.text)
+        assertState(AutoSpacingManager.SpaceState.PHANTOM)
+    }
+
+    @Test
     fun backspaceAndEnterResetTheState() {
         spacing.commitWord("слово")
         assertState(AutoSpacingManager.SpaceState.PHANTOM)
@@ -253,13 +324,82 @@ class AutoSpacingManagerTest {
     }
 
     @Test
+    fun deletingSentenceWordKeepsTheSpaceAfterPunctuation() {
+        val editor = FakeEditor("привет. Как")
+        val spacing = AutoSpacingManager(editor)
+        editor.deleteBeforeCursor(3)
+        spacing.onTextDeleted("Как")
+
+        assertFalse(spacing.commitTyped("Н"))
+        assertEquals("привет. Н", editor.text)
+    }
+
+    @Test
+    fun deletingSentenceWordAndItsSpaceRestoresTheSpace() {
+        val editor = FakeEditor("привет? Как")
+        val spacing = AutoSpacingManager(editor)
+        editor.deleteBeforeCursor(4)
+        spacing.onTextDeleted(" Как")
+
+        assertTrue(spacing.commitTyped("С"))
+        assertEquals("привет? С", editor.text)
+    }
+
+    @Test
+    fun deletionSelectionCallbackDoesNotWipeTheRestoredState() {
+        val editor = FakeEditor("привет мир")
+        val spacing = AutoSpacingManager(editor)
+        editor.deleteBeforeCursor(4)
+        spacing.onTextDeleted(" мир")
+        assertEquals(AutoSpacingManager.SpaceState.PHANTOM, spacing.state)
+
+        // The editor reports the direct InputConnection deletion asynchronously.
+        spacing.onSelectionChanged(10, 10, 6, 6)
+
+        assertEquals(AutoSpacingManager.SpaceState.PHANTOM, spacing.state)
+    }
+
+    @Test
+    fun deletingAWordAndItsSeparatorRestoresTheNextSpace() {
+        val editor = FakeEditor("привет мир")
+        val spacing = AutoSpacingManager(editor)
+        editor.deleteBeforeCursor(4)
+        spacing.onTextDeleted(" мир")
+
+        assertTrue(spacing.commitTyped("новое"))
+        assertEquals("привет новое", editor.text)
+    }
+
+    @Test
+    fun deletingOnlyASpaceAllowsJoiningWords() {
+        val editor = FakeEditor("привет ")
+        val spacing = AutoSpacingManager(editor)
+        editor.deleteBeforeCursor(1)
+        spacing.onTextDeleted(" ")
+
+        assertFalse(spacing.commitTyped("мир"))
+        assertEquals("приветмир", editor.text)
+    }
+
+    @Test
+    fun deletingLettersInsideAWordDoesNotAddASpace() {
+        val editor = FakeEditor("привет")
+        val spacing = AutoSpacingManager(editor)
+        editor.deleteBeforeCursor(1)
+        spacing.onTextDeleted("т")
+
+        assertFalse(spacing.commitTyped("и"))
+        assertEquals("привеи", editor.text)
+    }
+
+    @Test
     fun ownSelectionCallbackDoesNotResetStateButManualMoveDoes() {
         spacing.commitWord("слово")
-        spacing.onSelectionChanged(0, 0, 5, 5)
+        assertFalse(spacing.onSelectionChanged(0, 0, 5, 5))
         assertState(AutoSpacingManager.SpaceState.PHANTOM)
 
         Thread.sleep(180L)
-        spacing.onSelectionChanged(5, 5, 0, 0)
+        assertTrue(spacing.onSelectionChanged(5, 5, 0, 0))
         assertState(AutoSpacingManager.SpaceState.NONE)
     }
 
@@ -370,6 +510,64 @@ class AutoSpacingManagerTest {
             AutoSpacingManager.CharacterClass.TYPED,
             AutoSpacingManager.classify("7")
         )
+    }
+
+    // ------------------------------------------------------------------ undo recording
+
+    @Test
+    fun recordingCapturesTheSmartSpaceInsertedWithALetter() {
+        spacing.commitWord("слово")
+
+        spacing.beginRecording()
+        spacing.commitTyped("п")
+        val edit = spacing.endRecording()
+
+        assertEquals("" to " п", edit)
+        assertEquals("слово п", editor.text)
+    }
+
+    @Test
+    fun recordingCapturesASpaceRemovedByStickyPunctuation() {
+        spacing.commitWord("слово")
+        spacing.commitStickyPunctuation("!")
+        spacing.commitSpace()
+
+        spacing.beginRecording()
+        spacing.commitStickyPunctuation(",")
+        val edit = spacing.endRecording()
+
+        assertEquals(" " to ",", edit)
+        assertEquals("слово!,", editor.text)
+    }
+
+    @Test
+    fun recordingCapturesTheStarterLetterReplacedByASwipeWord() {
+        spacing.commitWord("слово")
+        val stateBeforeStarter = spacing.state
+
+        spacing.beginRecording()
+        spacing.commitTyped("п")
+        val starter = spacing.endRecording()
+
+        spacing.beginRecording()
+        spacing.replaceWord(1, "привет", stateBeforeStarter)
+        val replacement = spacing.endRecording()
+
+        assertEquals("" to " п", starter)
+        assertEquals("п" to "привет", replacement)
+        assertEquals("слово привет", editor.text)
+    }
+
+    @Test
+    fun replaceRawAppliesTextAndKeepsTheSavedUndoStateRestorable() {
+        spacing.commitWord("слово")
+        val before = spacing.undoState()
+
+        spacing.replaceRaw(0, " привет")
+        assertEquals("слово привет", editor.text)
+
+        spacing.restoreUndoState(before)
+        assertState(AutoSpacingManager.SpaceState.PHANTOM)
     }
 
     // ------------------------------------------------------------------ helpers

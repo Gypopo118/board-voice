@@ -175,7 +175,18 @@ class VoiceInputController(
             val before = connection.getTextBeforeCursor(1, 0)
             if (!before.isNullOrEmpty() && !before[0].isWhitespace() && output.firstOrNull()?.isWhitespace() != true) output = " $output"
         }
-        connection.commitText(output, 1)
+        // One batch keeps the whole transcript atomic for reactive fields, which may restart the
+        // input session while the text animation runs.
+        try {
+            connection.beginBatchEdit()
+            try {
+                connection.commitText(output, 1)
+            } finally {
+                connection.endBatchEdit()
+            }
+        } catch (_: Exception) {
+            // A dying connection must not crash the IME; the session is restarted by the app.
+        }
         onCommitted()
     }
 

@@ -70,13 +70,18 @@ class InputRouter {
     private val traces = HashMap<Int, Trace>()
 
     /**
+     * @param keyAt the view's own hit resolver. It also maps a near-miss in the small gap between
+     *   keys (and a point just outside the top/bottom row) to the nearest key, exactly like tap
+     *   handling. Without it a swipe that started one or two dp off the key was typed as a single
+     *   letter but never became eligible for gesture decoding.
      * @return true when this event was the end of a swipe consumed by [swipeSink].
      */
     fun route(
         event: MotionEvent,
         keys: List<KeyboardCanvasView.Hit>,
         layout: SwipeLayout?,
-        touchSlop: Float
+        touchSlop: Float,
+        keyAt: ((Float, Float) -> KeyboardCanvasView.Key?)? = null
     ): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
@@ -87,7 +92,7 @@ class InputRouter {
                 traces[id] = Trace(x, y).apply {
                     addPoint(x, y, event.eventTime)
                     if (layout != null) {
-                        val key = hitAt(keys, x, y)?.key
+                        val key = keyAt?.invoke(x, y) ?: hitAt(keys, x, y)?.key
                         if (isLetterKey(key)) {
                             startKey = key
                             this.layout = layout

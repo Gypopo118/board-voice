@@ -18,6 +18,7 @@ import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.core.view.WindowCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,8 +26,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Locale
-import kotlin.math.abs
 
 /**
  * Full keyboard IME. The canvas owns drawing and raw touch handling; this class translates key
@@ -40,9 +41,17 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
     private val clipboardManager by lazy {
         getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     }
-    private val clipboardHistory = ArrayDeque<String>()
+    /** Persisted across IME process restarts, unlike the old in-memory deque. */
+    private val clipboardHistory by lazy {
+        ClipboardHistoryStore(
+            File(filesDir, CLIPBOARD_HISTORY_FILE),
+            MAX_CLIPBOARD_HISTORY
+        )
+    }
     private val clipboardWatcher =
         ClipboardManager.OnPrimaryClipChangedListener { rememberCurrentClipboard() }
+    private val greetingShort by lazy { getString(R.string.greeting_short) }
+    private val greetingLong by lazy { getString(R.string.greeting_long) }
 
     private lateinit var keyboard: KeyboardCanvasView
     private lateinit var voice: VoiceInputController
@@ -56,12 +65,68 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
     private var lastSwipeAt = 0L
     private var inputSession = 0
 
+    /** Selection reported by the editor; the spacebar drag moves the caret inside the text. */
+    private var selectionStart = -1
+    private var selectionEnd = -1
+
+    /**
+     * Connection pinning and batching for one logical insertion. Reactive fields (Compose
+     * BasicTextField) may restart the input session while they animate the inserted text; every
+     * edit of one insertion must go to the same connection, with nothing landing on a session
+     * that is already being replaced.
+     */
+    private val textEditor = AtomicTextEditor { currentInputConnection }
+
+    /** Text of the last compound insertion; selection callbacks that only confirm it are ours. */
+    private var lastInsertedText: String? = null
+    private var lastInsertedAt = 0L
+    private val caretMover = CaretMover(object : CaretMover.Editor {
+        override fun selectionStart(): Int = selectionStart
+
+        override fun selectionEnd(): Int = selectionEnd
+
+        override fun applySelection(start: Int, end: Int): Boolean {
+            val connection = currentInputConnection ?: return false
+            return try {
+                // A direct selection change keeps the field focused: unlike an arrow key it can
+                // never reach Android's focus navigation when the caret sits at a text edge.
+                connection.setSelection(start, end)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        override fun textBeforeCursor(maxChars: Int): String? = try {
+            currentInputConnection?.getTextBeforeCursor(maxChars, 0)?.toString()
+        } catch (_: Exception) {
+            null
+        }
+
+        override fun textAfterCursor(maxChars: Int): String? = try {
+            currentInputConnection?.getTextAfterCursor(maxChars, 0)?.toString()
+        } catch (_: Exception) {
+            null
+        }
+
+        override fun sendArrowKey(forward: Boolean) {
+            val connection = currentInputConnection ?: return
+            val keyCode = if (forward) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
+            try {
+                connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+                connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            } catch (_: Exception) {
+                // A dying InputConnection must not crash the keyboard.
+            }
+        }
+    })
+
     /** State before a swipe's starter letter was typed; restored when the swipe result arrives. */
     private var spacingBeforeLetter = AutoSpacingManager.SpaceState.NONE
     private var starterLetterInsertedSpace = false
 
     private var currentWord = ""
     private var wordRaw = ""
+    private var currentPreviousWord: String? = null
     private var russianLayout = true
     private var caps = false
     private var oneShotShift = false
@@ -73,6 +138,10 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
     private var spaceDragApplied = 0
     private var wakeLock: PowerManager.WakeLock? = null
 
+    private val editHistory = EditHistory()
+    private var pendingLetterEntry: EditHistory.Entry? = null
+    private var magicJob: Job? = null
+
     // ------------------------------------------------------------------ lifecycle
 
     override fun onCreate() {
@@ -81,19 +150,33 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
             engine.load { if (::keyboard.isInitialized) updateSuggestions() }
         }
         spacing = AutoSpacingManager(object : AutoSpacingManager.Editor {
-            override fun textBeforeCursor(maxChars: Int): String? =
-                currentInputConnection?.getTextBeforeCursor(maxChars, 0)?.toString()
+            override fun textBeforeCursor(maxChars: Int): String? = try {
+                activeConnection()?.getTextBeforeCursor(maxChars, 0)?.toString()
+            } catch (_: Exception) {
+                null
+            }
 
             override fun commitText(text: String) {
-                currentInputConnection?.commitText(text, 1)
+                try {
+                    activeConnection()?.commitText(text, 1)
+                } catch (_: Exception) {
+                    // A dying connection is handled by the verification of the compound edit.
+                }
             }
 
             override fun deleteBeforeCursor(count: Int) {
-                if (count > 0) currentInputConnection?.deleteSurroundingText(count, 0)
+                if (count <= 0) return
+                try {
+                    activeConnection()?.deleteSurroundingText(count, 0)
+                } catch (_: Exception) {
+                }
             }
 
-            override fun hasSelection(): Boolean =
-                currentInputConnection?.getSelectedText(0).isNullOrEmpty() == false
+            override fun hasSelection(): Boolean = try {
+                activeConnection()?.getSelectedText(0).isNullOrEmpty() == false
+            } catch (_: Exception) {
+                false
+            }
         })
         voice = VoiceInputController(
             this,
@@ -121,27 +204,43 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
 
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        selectionStart = info?.initialSelStart ?: -1
+        selectionEnd = info?.initialSelEnd ?: -1
         if (!::keyboard.isInitialized) return
         inputSession++
+        magicJob?.cancel()
+        magicJob = null
+        if (voice.state == VoiceInputController.State.IDLE) keyboard.showStatus(null)
         keyboard.swipeEnabled = gestureTypingAllowed(info)
         spacing.setInputType(info?.inputType)
         if (!caps) {
-            val empty = try {
-                currentInputConnection?.getTextBeforeCursor(1, 0).isNullOrEmpty()
+            val before = try {
+                currentInputConnection?.getTextBeforeCursor(AUTO_CAP_LOOKBACK, 0)?.toString()
             } catch (_: Exception) {
-                false
+                null
             }
-            oneShotShift = empty && autoCapAllowed(info)
+            oneShotShift = before != null &&
+                autoCapAllowed(info) &&
+                AutoCapPolicy.shouldCapitalizeAfter(before)
             lastShiftAt = 0L
         }
         keyboard.setShift(oneShotShift, caps)
+        editHistory.clear()
+        pendingLetterEntry = null
         clearWordState()
         refreshWord()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         inputSession++
+        selectionStart = -1
+        selectionEnd = -1
+        lastInsertedText = null
         stopBackspaceRepeat()
+        magicJob?.cancel()
+        magicJob = null
+        editHistory.clear()
+        pendingLetterEntry = null
         clearWordState()
         spacing.reset()
         voice.cancel(notify = false)
@@ -157,6 +256,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         }
         handler.removeCallbacksAndMessages(null)
         releaseWakefulness()
+        if (::prediction.isInitialized) prediction.flushUserWords()
         scope.cancel()
         super.onDestroy()
     }
@@ -177,13 +277,24 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         candidatesEnd: Int
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        // Negative values mean the editor dropped the connection; the next input restores them.
+        selectionStart = newSelStart
+        selectionEnd = newSelEnd
         if (!::keyboard.isInitialized || newSelStart < 0 || newSelEnd < 0) return
-        spacing.onSelectionChanged(oldSelStart, oldSelEnd, newSelStart, newSelEnd)
+        val manualMove = spacing.onSelectionChanged(oldSelStart, oldSelEnd, newSelStart, newSelEnd)
+        // A reactive field reports the caret moving to the end of the word the keyboard itself
+        // just inserted. Treat that callback as our own edit, not as a manual cursor move: resetting
+        // the word state here would drop the suggestion panel that belongs to the new word.
+        if (isOwnInsertionSelection(newSelStart, newSelEnd)) {
+            refreshWord()
+            return
+        }
         if (newSelStart != newSelEnd) {
             spacing.reset()
             clearWordState()
         } else {
             refreshWord()
+            if (manualMove) refreshAutoShiftFromContext()
         }
     }
 
@@ -191,12 +302,9 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
 
     override fun onKeyDown(key: KeyboardCanvasView.Key) {
         when (key.action) {
-            KeyboardCanvasView.Action.LETTER -> {
-                spacingBeforeLetter = spacing.state
-                starterLetterInsertedSpace = commitCharacter(key.label)
-            }
-            KeyboardCanvasView.Action.COMMA -> insertPunctuation(",")
-            KeyboardCanvasView.Action.PERIOD -> insertPunctuation(".")
+            KeyboardCanvasView.Action.LETTER -> typeLetter(key)
+            KeyboardCanvasView.Action.COMMA -> recordEdit { insertPunctuation(",") }
+            KeyboardCanvasView.Action.PERIOD -> recordEdit { insertPunctuation(".") }
             KeyboardCanvasView.Action.BACKSPACE -> {
                 deleteOnce()
                 startBackspaceRepeat()
@@ -208,7 +316,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
 
     override fun onKeyAction(key: KeyboardCanvasView.Key) {
         when (key.action) {
-            KeyboardCanvasView.Action.SPACE -> commitSpace()
+            KeyboardCanvasView.Action.SPACE -> recordEdit { commitSpace() }
             KeyboardCanvasView.Action.SYMBOLS -> {
                 keyboard.toggleSymbols()
                 if (keyboard.symbols) {
@@ -223,13 +331,21 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
                 keyboard.setLanguage(russianLayout)
                 clearWordState()
             }
-            KeyboardCanvasView.Action.ENTER -> pressEnter()
+            KeyboardCanvasView.Action.ENTER -> recordEdit { pressEnter() }
+            KeyboardCanvasView.Action.UNDO -> performUndo()
+            KeyboardCanvasView.Action.REDO -> performRedo()
             KeyboardCanvasView.Action.AC -> clearAll()
             KeyboardCanvasView.Action.CLIPBOARD -> {
                 keyboard.setClipboard(readClipboard())
                 keyboard.toggleClipboard()
             }
-            KeyboardCanvasView.Action.MIC -> voice.toggle()
+            KeyboardCanvasView.Action.MAGIC -> fixTextWithMagic()
+            KeyboardCanvasView.Action.GREETING -> insertGreeting(greetingShort)
+            KeyboardCanvasView.Action.MIC -> {
+                magicJob?.cancel()
+                magicJob = null
+                voice.toggle()
+            }
             else -> Unit
         }
     }
@@ -239,6 +355,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
             key.action == KeyboardCanvasView.Action.AC -> openSettings()
             key.action == KeyboardCanvasView.Action.LANGUAGE -> showInputMethodPicker()
             key.action == KeyboardCanvasView.Action.BACKSPACE -> Unit
+            key.action == KeyboardCanvasView.Action.GREETING -> insertGreeting(greetingLong)
             key.secondary.isNotEmpty() -> commitSecondary(key)
         }
     }
@@ -258,19 +375,18 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         val step = dp(10f)
         if (step <= 0f) return
         val desired = (totalDx / step).toInt()
-        val difference = (desired - spaceDragApplied).coerceIn(-40, 40)
+        val difference = (desired - spaceDragApplied)
+            .coerceIn(-MAX_SPACE_DRAG_STEPS, MAX_SPACE_DRAG_STEPS)
         if (difference == 0) return
-        val connection = currentInputConnection
-        if (connection == null) {
-            spaceDragApplied = desired
-            return
+        // The applied counter follows the finger even when the caret already sits at an edge of
+        // the text, so dragging back moves the caret immediately instead of replaying the steps
+        // that could not move it.
+        spaceDragApplied = desired
+        val moved = caretMover.move(difference)
+        if (moved >= 0) {
+            selectionStart = moved
+            selectionEnd = moved
         }
-        val keyCode = if (difference > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
-        repeat(abs(difference)) {
-            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
-            connection.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
-        }
-        spaceDragApplied += difference
         refreshWord()
     }
 
@@ -280,40 +396,70 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
     }
 
     override fun onSuggestion(word: String) {
-        val connection = currentInputConnection ?: return
-        if (!connection.getSelectedText(0).isNullOrEmpty()) return
-
         val swipe = currentSwipeContext()
-        if (swipe != null) {
-            val chosen = caseSuggestion(word, swipe.raw)
-            val insertion = spacing.replaceWord(swipe.raw.length, chosen)
-            consumeOneShotShift()
+        val typed = if (swipe != null) swipe.raw else readTrailingWord()
+        val chosen = caseSuggestion(word, typed)
+        val stateBefore = spacing.state
 
+        // Delete the draft and commit the chosen word as one batch on one connection snapshot.
+        // Compose fields may restart the input session while the text animates; a separate
+        // deleteSurroundingText() + commitText() was the pair that could straddle that restart.
+        val insertion = compoundEdit { connection ->
+            if (!connection.getSelectedText(0).isNullOrEmpty()) return@compoundEdit null
+            val draft = textBefore(connection, typed.length)
+            val draftPresent = typed.isEmpty() || draft.equals(typed, ignoreCase = true)
+            val start = beginHistoryEdit()
+            try {
+                if (draftPresent) {
+                    spacing.replaceWord(typed.length, chosen, stateBefore)
+                } else {
+                    // Compose restarted the session and dropped the draft. The tap is a deliberate
+                    // choice: insert the picked word with smart spacing instead of losing it.
+                    spacing.commitWord(chosen)
+                }
+            } finally {
+                consumeOneShotShift()
+                finishHistoryEdit(start)
+            }
+        } ?: return
+
+        verifyReplacement(
+            expected = (if (insertion.leadingSpace) " " else "") + chosen,
+            word = chosen,
+            replacedCount = typed.length,
+            replacedWord = typed,
+            stateBefore = stateBefore
+        )
+        prediction.recordSelection(chosen, russianLayout)
+
+        if (swipe != null) {
             wordRaw = chosen
             currentWord = chosen.lowercase(Locale.ROOT)
             swipeWord = chosen.lowercase(Locale.ROOT)
             swipeLeadingSpace = swipe.leadingSpace || insertion.leadingSpace
             lastSwipeAt = SystemClock.uptimeMillis()
             if (::keyboard.isInitialized) keyboard.suggestions = swipeCandidates
-            return
+        } else {
+            // Keep the committed word as the current token: the selection callback that follows the
+            // commit must not immediately reopen T9 suggestions for the word the user just chose.
+            suggestionJob?.cancel()
+            clearSwipeState()
+            wordRaw = chosen
+            currentWord = chosen.lowercase(Locale.ROOT)
+            if (::keyboard.isInitialized) keyboard.suggestions = emptyList()
         }
-
-        val typed = readTrailingWord()
-        val chosen = caseSuggestion(word, typed)
-        spacing.replaceWord(typed.length, chosen)
-        consumeOneShotShift()
-        // Keep the committed word as the current token: the selection callback that follows the
-        // commit must not immediately reopen T9 suggestions for the word the user just chose.
-        suggestionJob?.cancel()
-        clearSwipeState()
-        wordRaw = chosen
-        currentWord = chosen.lowercase(Locale.ROOT)
-        if (::keyboard.isInitialized) keyboard.suggestions = emptyList()
     }
 
     override fun onClipboard(text: String) {
-        if (currentInputConnection == null) return
-        spacing.commitRaw(text)
+        if (compoundEdit {
+                recordEdit {
+                    spacing.commitRaw(text)
+                    refreshAutoShiftFromContext()
+                }
+            } == null
+        ) {
+            return
+        }
         rememberClipboard(text)
         clearWordState()
     }
@@ -340,12 +486,16 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
             keyboard.showStatus(getString(R.string.status_dictionary_loading), false, 1_400L)
             return false
         }
-        val session = inputSession
+        val startSession = inputSession
+        val startPackage = currentInputEditorInfo?.packageName
         scope.launch {
             val results = withContext(Dispatchers.Default) {
                 swipeEngine.decode(gesture, layout, lexicon, 3)
             }
-            if (session != inputSession || !::keyboard.isInitialized ||
+            // Deliberately no inputSession check here: a Compose field may restart its input
+            // session while it animates the text. insertSwipeResult asks the fresh
+            // currentInputConnection and verifies the draft (or the same field after a restart).
+            if (!::keyboard.isInitialized ||
                 !keyboard.swipeEnabled || keyboard.symbols || keyboard.russian != language
             ) {
                 return@launch
@@ -355,7 +505,12 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
                 return@launch
             }
             try {
-                insertSwipeResult(results, startKey)
+                insertSwipeResult(
+                    results,
+                    startKey,
+                    sessionChanged = startSession != inputSession,
+                    startPackage = startPackage
+                )
             } catch (_: Exception) {
                 // A dying InputConnection must not crash the keyboard; the starter letter stays.
             }
@@ -363,40 +518,346 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         return true
     }
 
+    private data class SwipeInsertion(
+        val cased: String,
+        val topWord: String,
+        val firstIsUpper: Boolean,
+        val insertion: AutoSpacingManager.WordInsertion,
+        val stateBeforeStarter: AutoSpacingManager.SpaceState,
+        val starterSpace: Boolean
+    )
+
     private fun insertSwipeResult(
         results: List<SwipeEngine.Result>,
-        startKey: KeyboardCanvasView.Key
+        startKey: KeyboardCanvasView.Key,
+        sessionChanged: Boolean,
+        startPackage: String?
     ) {
-        val connection = currentInputConnection ?: return
         val startLetter = startKey.label[0].lowercaseChar()
-        val firstRaw = connection.getTextBeforeCursor(1, 0)?.toString().orEmpty()
-        if (firstRaw.length != 1 || firstRaw[0].lowercaseChar() != startLetter) return
-        if (!connection.getSelectedText(0).isNullOrEmpty()) return
+        val sameField = startPackage != null && currentInputEditorInfo?.packageName == startPackage
+        // One batch, one connection snapshot: Compose fields must not observe the starter letter
+        // deleted without its replacement already committed.
+        val applied = compoundEdit { connection ->
+            if (!connection.getSelectedText(0).isNullOrEmpty()) return@compoundEdit null
+            val firstRaw = textBefore(connection, 1)
+            val starterPresent =
+                firstRaw.length == 1 && firstRaw[0].lowercaseChar() == startLetter
+            if (!starterPresent) {
+                // A reactive field may rebuild its text during the insertion animation and drop
+                // even the starter letter. If this is still the same field, insert the decoded
+                // word instead of leaving the user with an empty input box.
+                if (!sessionChanged || !sameField) return@compoundEdit null
+                val context = textBefore(connection, AUTO_CAP_LOOKBACK)
+                val capitalize = AutoCapPolicy.shouldCapitalizeAfter(context)
+                val topWord = results.first().word
+                val cased = SwipeTextPolicy.caseWord(
+                    prediction.displayWord(topWord, russianLayout), caps, capitalize
+                )
+                val stateBefore = spacing.state
+                val start = beginHistoryEdit()
+                val insertion = try {
+                    spacing.commitWord(cased)
+                } finally {
+                    consumeOneShotShift()
+                    finishHistoryEdit(start)
+                }
+                pendingLetterEntry = null
+                return@compoundEdit SwipeInsertion(
+                    cased, topWord, capitalize, insertion, stateBefore, false
+                )
+            }
 
-        val firstIsUpper = firstRaw[0].isUpperCase()
-        val topWord = results.first().word
-        val cased = SwipeTextPolicy.caseWord(topWord, caps, firstIsUpper)
-        val stateBeforeStarter = spacingBeforeLetter
-        val starterSpace = starterLetterInsertedSpace
+            val firstIsUpper = firstRaw[0].isUpperCase()
+            val topWord = results.first().word
+            val cased = SwipeTextPolicy.caseWord(
+                prediction.displayWord(topWord, russianLayout), caps, firstIsUpper
+            )
+            val stateBeforeStarter = spacingBeforeLetter
+            val starterSpace = starterLetterInsertedSpace
 
-        connection.beginBatchEdit()
-        val insertion = try {
-            spacing.replaceWord(1, cased, stateBeforeStarter)
-        } finally {
-            connection.endBatchEdit()
+            val start = beginHistoryEdit()
+            val insertion = try {
+                spacing.replaceWord(1, cased, stateBeforeStarter)
+            } finally {
+                val replacementEntry = finishHistoryEdit(start)
+                // The starter letter was recorded as a normal key press on touch-down. Merge the
+                // swipe replacement into it so one undo removes the whole swiped word.
+                val starterEntry = pendingLetterEntry
+                if (starterEntry != null && replacementEntry != null) {
+                    editHistory.replaceLast(
+                        starterEntry,
+                        EditHistory.combine(starterEntry, replacementEntry)
+                    )
+                }
+                pendingLetterEntry = null
+            }
+            SwipeInsertion(
+                cased, topWord, firstIsUpper, insertion, stateBeforeStarter, starterSpace
+            )
+        } ?: return
+
+        val expected = (if (applied.insertion.leadingSpace) " " else "") + applied.cased
+        if (!tailMatches(expected)) {
+            // The field restarted its input session before the word landed. Retry once on the
+            // fresh connection, recovering from whatever is actually in front of the caret.
+            compoundEdit { connection ->
+                if (tailMatches(expected, connection)) return@compoundEdit
+                val tail = textBefore(connection, expected.length + 1)
+                if (tail.endsWith(expected, ignoreCase = true)) return@compoundEdit
+                val last = textBefore(connection, 1)
+                if (last.length == 1 && last[0].lowercaseChar() == startLetter) {
+                    spacing.replaceWord(1, applied.cased, applied.stateBeforeStarter)
+                } else if (!tail.endsWith(applied.cased, ignoreCase = true)) {
+                    spacing.commitWord(applied.cased)
+                }
+            }
         }
+        markInserted(applied.cased)
 
         suggestionJob?.cancel()
-        wordRaw = cased
-        currentWord = cased.lowercase(Locale.ROOT)
-        swipeWord = topWord.lowercase(Locale.ROOT)
+        wordRaw = applied.cased
+        currentWord = applied.cased.lowercase(Locale.ROOT)
+        swipeWord = applied.topWord.lowercase(Locale.ROOT)
         swipeCandidates = results.map {
-            SwipeTextPolicy.caseWord(it.word, caps, firstIsUpper)
+            SwipeTextPolicy.caseWord(
+                prediction.displayWord(it.word, russianLayout), caps, applied.firstIsUpper
+            )
         }
-        swipeLeadingSpace = insertion.leadingSpace || starterSpace
+        swipeLeadingSpace = applied.insertion.leadingSpace || applied.starterSpace
         lastSwipeAt = SystemClock.uptimeMillis()
         if (::keyboard.isInitialized) keyboard.suggestions = swipeCandidates
     }
+
+    // ------------------------------------------------------------------ atomic text insertion
+
+    private fun activeConnection(): InputConnection? = textEditor.active()
+
+    /**
+     * Runs [block] as one atomic edit on a single connection snapshot inside
+     * beginBatchEdit()/endBatchEdit(). See [AtomicTextEditor] for why a reactive field needs it.
+     */
+    private fun <T> compoundEdit(block: (InputConnection) -> T): T? = textEditor.run(block)
+
+    private fun textBefore(connection: InputConnection?, maxChars: Int): String =
+        textEditor.textBefore(maxChars, connection)
+
+    /** True when the text before the caret ends with [expected], ignoring case. */
+    private fun tailMatches(
+        expected: String,
+        connection: InputConnection? = activeConnection()
+    ): Boolean = textEditor.tailMatches(expected, connection)
+
+    private fun markInserted(word: String) {
+        lastInsertedText = word
+        lastInsertedAt = SystemClock.uptimeMillis()
+    }
+
+    /**
+     * After a swipe/suggestion replace, a reactive field may still report the caret moving to the
+     * end of the word we just wrote. Such a callback is ours, not a manual move: it must not reset
+     * the word state or the suggestion panel.
+     */
+    private fun isOwnInsertionSelection(start: Int, end: Int): Boolean {
+        if (start != end) return false
+        val word = lastInsertedText ?: return false
+        if (word.isEmpty()) return false
+        if (SystemClock.uptimeMillis() - lastInsertedAt > OWN_SELECTION_WINDOW_MS) return false
+        val tail = textBefore(activeConnection(), word.length)
+        return tail.length == word.length && tail.equals(word, ignoreCase = true)
+    }
+
+    /**
+     * Verifies a word replacement and retries once when a reactive field dropped it. The retry
+     * checks what is actually in front of the caret first, so a word that did land is never
+     * inserted twice.
+     */
+    private fun verifyReplacement(
+        expected: String,
+        word: String,
+        replacedCount: Int,
+        replacedWord: String,
+        stateBefore: AutoSpacingManager.SpaceState
+    ) {
+        if (tailMatches(expected)) {
+            markInserted(word)
+            return
+        }
+        compoundEdit { connection ->
+            if (tailMatches(expected, connection)) return@compoundEdit
+            val tail = textBefore(connection, expected.length + replacedCount)
+            if (tail.endsWith(expected, ignoreCase = true)) return@compoundEdit
+            val typed = textBefore(connection, replacedCount)
+            if (replacedCount > 0 && typed.equals(replacedWord, ignoreCase = true)) {
+                // The draft survived but the replacement did not: repeat it on the fresh session.
+                spacing.replaceWord(replacedCount, word, stateBefore)
+            } else if (!tail.endsWith(word, ignoreCase = true)) {
+                // The field dropped the draft entirely: append the word with smart spacing.
+                spacing.commitWord(word)
+            }
+        }
+        if (tailMatches(expected)) markInserted(word)
+    }
+
+    // ------------------------------------------------------------------ edit history
+
+    private data class HistoryStart(
+        val selected: String,
+        val context: String,
+        val spacing: AutoSpacingManager.UndoState,
+        val oneShotShift: Boolean,
+        val caps: Boolean
+    )
+
+    /** Captures the editor state before one logical edit and starts recording its exact delta. */
+    private fun beginHistoryEdit(): HistoryStart? {
+        val connection = activeConnection() ?: return null
+        val selected = try {
+            connection.getSelectedText(0)?.toString().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+        val context = if (selected.isEmpty()) {
+            try {
+                connection.getTextBeforeCursor(HISTORY_CONTEXT, 0)?.toString().orEmpty()
+            } catch (_: Exception) {
+                ""
+            }
+        } else {
+            ""
+        }
+        spacing.beginRecording()
+        return HistoryStart(selected, context, spacing.undoState(), oneShotShift, caps)
+    }
+
+    private fun finishHistoryEdit(start: HistoryStart?): EditHistory.Entry? {
+        if (start == null) return null
+        val (recordedRemoved, inserted) = spacing.endRecording()
+        val removed = if (start.selected.isNotEmpty()) start.selected else recordedRemoved
+        if (removed.isEmpty() && inserted.isEmpty()) return null
+        val context = if (start.selected.isNotEmpty()) {
+            ""
+        } else {
+            start.context.dropLast(recordedRemoved.length).takeLast(HISTORY_CONTEXT)
+        }
+        return editHistory.record(
+            EditHistory.Entry(
+                context = context,
+                removed = removed,
+                inserted = inserted,
+                before = start.spacing,
+                after = spacing.undoState(),
+                oneShotShiftBefore = start.oneShotShift,
+                capsBefore = start.caps,
+                oneShotShiftAfter = oneShotShift,
+                capsAfter = caps
+            )
+        )
+    }
+
+    private inline fun recordEdit(block: () -> Unit) {
+        val start = beginHistoryEdit()
+        try {
+            block()
+        } finally {
+            finishHistoryEdit(start)
+        }
+    }
+
+    private fun typeLetter(key: KeyboardCanvasView.Key) {
+        val start = beginHistoryEdit()
+        spacingBeforeLetter = spacing.state
+        val abbreviationContinuation = key.label.length == 1 &&
+            key.label[0].isLetter() &&
+            start != null &&
+            AutoCapPolicy.isAbbreviationContinuation(start.context, key.label[0])
+        if (abbreviationContinuation && !caps) {
+            // The dot before this letter is internal to т.д./т.п./т.е., not a sentence end.
+            oneShotShift = false
+            lastShiftAt = 0L
+            if (::keyboard.isInitialized) keyboard.setShift(false, false)
+        }
+        val insertedSpace = try {
+            commitCharacter(key.label)
+        } finally {
+            pendingLetterEntry = finishHistoryEdit(start)
+        }
+        starterLetterInsertedSpace = insertedSpace
+    }
+
+    private fun performUndo() {
+        magicJob?.cancel()
+        magicJob = null
+        if (::keyboard.isInitialized && voice.state == VoiceInputController.State.IDLE) {
+            keyboard.showStatus(null)
+        }
+        val entry = editHistory.peekUndo() ?: return
+        if (!applyHistoryStep(entry, undo = true)) return
+        editHistory.undoApplied()
+        pendingLetterEntry = null
+        afterHistoryChange()
+    }
+
+    private fun performRedo() {
+        magicJob?.cancel()
+        magicJob = null
+        if (::keyboard.isInitialized && voice.state == VoiceInputController.State.IDLE) {
+            keyboard.showStatus(null)
+        }
+        val entry = editHistory.peekRedo() ?: return
+        if (!applyHistoryStep(entry, undo = false)) return
+        editHistory.redoApplied()
+        pendingLetterEntry = null
+        afterHistoryChange()
+    }
+
+    /**
+     * Replaces [oldText] with [newText] only when the editor still contains the expected tail.
+     * This keeps an undo from cutting text after the user moved the cursor or another app edited
+     * the field in the meantime.
+     */
+    private fun applyHistoryStep(entry: EditHistory.Entry, undo: Boolean): Boolean {
+        val connection = currentInputConnection ?: return false
+        val hasSelection = try {
+            !connection.getSelectedText(0).isNullOrEmpty()
+        } catch (_: Exception) {
+            false
+        }
+        if (hasSelection) return false
+
+        val oldText = if (undo) entry.inserted else entry.removed
+        val newText = if (undo) entry.removed else entry.inserted
+        val expected = entry.context + oldText
+        if (expected.isNotEmpty()) {
+            val current = try {
+                connection.getTextBeforeCursor(expected.length, 0)?.toString()
+            } catch (_: Exception) {
+                null
+            }
+            if (current != expected) return false
+        }
+        try {
+            spacing.replaceRaw(oldText.length, newText)
+        } catch (_: Exception) {
+            return false
+        }
+        val state = if (undo) entry.before else entry.after
+        if (state != null) spacing.restoreUndoState(state)
+        oneShotShift = if (undo) entry.oneShotShiftBefore else entry.oneShotShiftAfter
+        caps = if (undo) entry.capsBefore else entry.capsAfter
+        lastShiftAt = 0L
+        if (::keyboard.isInitialized) keyboard.setShift(oneShotShift, caps)
+        return true
+    }
+
+    private fun afterHistoryChange() {
+        suggestionJob?.cancel()
+        clearWordState()
+        refreshWord()
+        if (::keyboard.isInitialized && voice.state == VoiceInputController.State.IDLE) {
+            keyboard.showStatus(null)
+        }
+    }
+
 
     // ------------------------------------------------------------------ text editing
 
@@ -409,7 +870,6 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
             }
             AutoSpacingManager.CharacterClass.OPENING_PUNCTUATION -> {
                 spacing.commitOpening(raw)
-                consumeOneShotShift()
                 refreshWord()
                 false
             }
@@ -483,30 +943,77 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
      * The next word will receive the phantom space instead: `слово, слово`.
      */
     private fun insertPunctuation(mark: String, dropLeadingSpace: Boolean = false) {
-        if (currentInputConnection == null) return
-        spacing.commitStickyPunctuation(mark, dropLeadingSpace)
+        // Sticky punctuation can withdraw the weak space and then write the mark: one batch.
+        if (compoundEdit {
+                if (activeConnection() == null) return@compoundEdit
+                learnCurrentWord()
+                spacing.commitStickyPunctuation(mark, dropLeadingSpace)
+            } == null
+        ) {
+            return
+        }
         clearWordState()
-        if (AutoCapPolicy.endsSentence(mark)) enableAutoShift()
-    }
-
-    private fun enableAutoShift() {
-        if (caps || !autoCapAllowed(currentInputEditorInfo)) return
-        oneShotShift = true
-        lastShiftAt = 0L
-        if (::keyboard.isInitialized) keyboard.setShift(true, false)
+        refreshAutoShiftFromContext()
     }
 
     private fun autoCapAllowed(info: EditorInfo?): Boolean =
         info != null && AutoCapPolicy.allows(info.inputType)
 
+    /**
+     * Greeting button: inserts a ready-made phrase. The first letter follows the auto-cap context
+     * (field start or after `. ! ? …`), the smart spacing decides whether a leading space is
+     * needed, and the insertion stays one undoable action.
+     */
+    private fun insertGreeting(base: String) {
+        val expected = compoundEdit { connection ->
+            val text = greetingText(base, textBefore(connection, AUTO_CAP_LOOKBACK))
+            recordEdit {
+                spacing.commitRaw(text)
+                // Recompute Shift inside the recorded edit so undo/redo restores the right case state.
+                refreshAutoShiftFromContext()
+            }
+            text
+        } ?: return
+        if (!tailMatches(expected)) {
+            compoundEdit { connection ->
+                // Recompute against what is actually in the field after the session restart.
+                val text = greetingText(base, textBefore(connection, AUTO_CAP_LOOKBACK))
+                if (!tailMatches(text, connection)) spacing.commitRaw(text)
+            }
+        }
+        markInserted(expected.trimStart())
+        clearWordState()
+    }
+
+    /** The greeting with the case and the optional leading space taken from [context]. */
+    private fun greetingText(base: String, context: String): String {
+        val phrase = GreetingPolicy.forCursor(base, context)
+        val prefix = if (GreetingPolicy.needsLeadingSpace(context, phrase)) " " else ""
+        return prefix + phrase
+    }
+
     private fun commitSpace() {
-        if (currentInputConnection == null) return
+        if (activeConnection() == null) return
+        learnCurrentWord()
         spacing.commitSpace()
         clearWordState()
     }
 
+    /**
+     * The word just finished (space, punctuation, Enter) joins the personal dictionary. Disabled
+     * for e-mail, URI, password and numeric fields where the shared spacing policy is off.
+     */
+    private fun learnCurrentWord() {
+        if (!spacing.enabled) return
+        val word = currentWord
+        if (word.length < 2) return
+        for (letter in word) if (!letter.isLetter()) return
+        prediction.learnWord(word, russianLayout)
+    }
+
     private fun pressEnter() {
-        val connection = currentInputConnection ?: return
+        val connection = activeConnection() ?: return
+        learnCurrentWord()
         spacing.onEnter()
         val info = currentInputEditorInfo
         val multiline = info != null && (
@@ -517,73 +1024,123 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         if (multiline || action == EditorInfo.IME_ACTION_NONE || action == EditorInfo.IME_ACTION_UNSPECIFIED) {
             spacing.commitRaw("\n")
             clearWordState()
-            enableAutoShift()
+            refreshAutoShiftFromContext()
             return
         }
         connection.performEditorAction(action)
         clearWordState()
     }
 
-    private fun clearAll() {
-        val connection = currentInputConnection ?: return
-        var cleared = false
-        try {
-            if (connection.performContextMenuAction(android.R.id.selectAll)) {
-                val selected = connection.getSelectedText(0)
-                if (!selected.isNullOrEmpty()) {
-                    connection.commitText("", 1)
-                    cleared = true
-                }
+    /**
+     * Recomputes the automatic Shift from the text before the cursor. This replaces the old
+     * one-character check: trailing spaces and closing quotes are skipped, abbreviation endings are
+     * not treated as sentence ends, and a stale Shift is cleared when the period was deleted.
+     */
+    private fun refreshAutoShiftFromContext() {
+        if (caps) return
+        val connection = activeConnection() ?: return
+        if (!autoCapAllowed(currentInputEditorInfo)) {
+            if (oneShotShift) {
+                oneShotShift = false
+                lastShiftAt = 0L
+                if (::keyboard.isInitialized) keyboard.setShift(false, caps)
             }
+            return
+        }
+        val before = try {
+            connection.getTextBeforeCursor(AUTO_CAP_LOOKBACK, 0)?.toString()
         } catch (_: Exception) {
+            null
         }
-        if (!cleared) {
-            val before = connection.getTextBeforeCursor(Int.MAX_VALUE, 0)
-            val after = connection.getTextAfterCursor(Int.MAX_VALUE, 0)
-            if (!before.isNullOrEmpty() || !after.isNullOrEmpty()) {
-                try {
-                    connection.deleteSurroundingText(before?.length ?: 0, after?.length ?: 0)
-                } catch (_: Exception) {
-                }
-            }
-        }
-        clearWordState()
-        spacing.reset()
-        refreshAutoShiftAfterDeletion()
+        val desired = AutoCapPolicy.shouldCapitalizeAfter(before)
+        if (desired == oneShotShift) return
+        oneShotShift = desired
+        lastShiftAt = 0L
+        if (::keyboard.isInitialized) keyboard.setShift(oneShotShift, caps)
     }
 
-    /**
-     * Backspace can return the cursor to an empty field, a new line or the end of a sentence.
-     * The Shift that produced the deleted capital was consumed, so the next letter needs it again.
-     */
-    private fun refreshAutoShiftAfterDeletion() {
-        if (caps) return
-        val before = currentInputConnection?.getTextBeforeCursor(1, 0)?.toString()
-        if (AutoCapPolicy.shouldCapitalizeAfterDeletion(before)) enableAutoShift()
+    private data class DeletionWindow(val text: String, val context: String)
+
+    /** Reads exactly what a backspace is about to delete plus the unchanged prefix before it. */
+    private fun deletionWindow(connection: InputConnection, count: Int): DeletionWindow {
+        if (count <= 0) return DeletionWindow("", "")
+        val window = try {
+            connection.getTextBeforeCursor(HISTORY_CONTEXT + count, 0)?.toString().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+        val text = if (window.length <= count) window else window.substring(window.length - count)
+        val context = if (window.length <= count) {
+            ""
+        } else {
+            window.substring(0, window.length - count)
+        }
+        return DeletionWindow(text, context)
+    }
+
+    private fun recordDeletion(
+        removed: String,
+        context: String,
+        beforeState: AutoSpacingManager.UndoState,
+        shiftBefore: Boolean,
+        capsBefore: Boolean
+    ) {
+        if (removed.isEmpty()) return
+        editHistory.record(
+            EditHistory.Entry(
+                context = context.takeLast(HISTORY_CONTEXT),
+                removed = removed,
+                inserted = "",
+                before = beforeState,
+                after = spacing.undoState(),
+                oneShotShiftBefore = shiftBefore,
+                capsBefore = capsBefore,
+                oneShotShiftAfter = oneShotShift,
+                capsAfter = caps
+            )
+        )
     }
 
     private fun deleteOnce() {
-        val connection = currentInputConnection ?: return
+        val connection = activeConnection() ?: return
+        val beforeState = spacing.undoState()
+        val shiftBefore = oneShotShift
+        val capsBefore = caps
         spacing.onBackspace()
-        if (!connection.getSelectedText(0).isNullOrEmpty()) {
+        val selection = try {
+            connection.getSelectedText(0)?.toString().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+        if (selection.isNotEmpty()) {
             connection.commitText("", 1)
+            spacing.onTextDeleted(selection)
             refreshWord()
-            refreshAutoShiftAfterDeletion()
+            refreshAutoShiftFromContext()
+            recordDeletion(selection, "", beforeState, shiftBefore, capsBefore)
             return
         }
-        if (deleteSwipeWordIfAny(connection)) return
+        if (deleteSwipeWordIfAny(connection, beforeState, shiftBefore, capsBefore)) return
         val before = connection.getTextBeforeCursor(2, 0)?.toString().orEmpty()
         val count = if (before.length == 2 && Character.isSurrogatePair(before[0], before[1])) 2 else 1
+        val window = deletionWindow(connection, count)
         connection.deleteSurroundingText(count, 0)
+        spacing.onTextDeleted(window.text)
         refreshWord()
-        refreshAutoShiftAfterDeletion()
+        refreshAutoShiftFromContext()
+        recordDeletion(window.text, window.context, beforeState, shiftBefore, capsBefore)
     }
 
     /**
      * A single Backspace immediately after gesture typing removes the whole swiped word (and the
      * smart space we inserted before it), not just the last letter.
      */
-    private fun deleteSwipeWordIfAny(connection: InputConnection): Boolean {
+    private fun deleteSwipeWordIfAny(
+        connection: InputConnection,
+        beforeState: AutoSpacingManager.UndoState,
+        shiftBefore: Boolean,
+        capsBefore: Boolean
+    ): Boolean {
         val target = swipeWord ?: return false
         if (SystemClock.uptimeMillis() - lastSwipeAt > SWIPE_BACKSPACE_WINDOW_MS) {
             clearSwipeState()
@@ -593,58 +1150,82 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         val count = SwipeTextPolicy.backspaceDeleteCount(
             context.raw, target, context.leadingSpace
         ) ?: return false
+        val window = deletionWindow(connection, count)
         connection.deleteSurroundingText(count, 0)
+        spacing.onTextDeleted(window.text)
         clearWordState()
         refreshWord()
-        refreshAutoShiftAfterDeletion()
+        refreshAutoShiftFromContext()
+        recordDeletion(window.text, window.context, beforeState, shiftBefore, capsBefore)
         return true
     }
 
     private fun deleteWord() {
-        val connection = currentInputConnection ?: return
+        val connection = activeConnection() ?: return
+        val beforeState = spacing.undoState()
+        val shiftBefore = oneShotShift
+        val capsBefore = caps
         spacing.onBackspace()
-        if (!connection.getSelectedText(0).isNullOrEmpty()) {
+        val selection = try {
+            connection.getSelectedText(0)?.toString().orEmpty()
+        } catch (_: Exception) {
+            ""
+        }
+        if (selection.isNotEmpty()) {
             connection.commitText("", 1)
+            spacing.onTextDeleted(selection)
             refreshWord()
-            refreshAutoShiftAfterDeletion()
+            refreshAutoShiftFromContext()
+            recordDeletion(selection, "", beforeState, shiftBefore, capsBefore)
             return
         }
-        val before = connection.getTextBeforeCursor(64, 0)?.toString().orEmpty()
+        val before = connection.getTextBeforeCursor(WORD_LOOKBACK + HISTORY_CONTEXT, 0)
+            ?.toString().orEmpty()
         if (before.isEmpty()) return
         val count = TRAILING_WORD.find(before)?.value?.length ?: 1
+        val window = deletionWindow(connection, count)
         connection.deleteSurroundingText(count, 0)
+        spacing.onTextDeleted(window.text)
         refreshWord()
-        refreshAutoShiftAfterDeletion()
+        refreshAutoShiftFromContext()
+        recordDeletion(window.text, window.context, beforeState, shiftBefore, capsBefore)
     }
 
     private fun commitSecondary(key: KeyboardCanvasView.Key) {
         val secondary = key.secondary
         if (secondary.isEmpty()) return
-        val connection = currentInputConnection ?: return
-        // The primary character was already inserted on touch-down. Its case tells us whether the
-        // user was holding Shift, which one-shot Shift has already consumed by now.
-        val primary = connection.getTextBeforeCursor(1, 0)?.toString().orEmpty()
-        val upper = caps || (primary.length == 1 && primary[0].isUpperCase())
-        deleteOnce()
-        val text = if (secondary.first().isLetter()) {
-            if (upper) secondary.uppercase(Locale.ROOT) else secondary.lowercase(Locale.ROOT)
-        } else {
-            secondary
+        val expected = compoundEdit { connection ->
+            // The primary character was already inserted on touch-down. Its case tells us whether
+            // the user was holding Shift, which one-shot Shift has already consumed by now.
+            val primary = textBefore(connection, 1)
+            val upper = caps || (primary.length == 1 && primary[0].isUpperCase())
+            deleteOnce()
+            val text = if (secondary.first().isLetter()) {
+                if (upper) secondary.uppercase(Locale.ROOT) else secondary.lowercase(Locale.ROOT)
+            } else {
+                secondary
+            }
+            val dropLeadingSpace = starterLetterInsertedSpace &&
+                AutoSpacingManager.classify(text) ==
+                AutoSpacingManager.CharacterClass.STICKY_PUNCTUATION
+            recordEdit { commitComposed(text, dropLeadingSpace) }
+            text
+        } ?: return
+        if (!tailMatches(expected)) {
+            // The field restarted its input session between the delete and the commit. The
+            // primary letter may already be gone, so only append what is missing.
+            compoundEdit {
+                if (!tailMatches(expected, it)) commitComposed(expected)
+            }
         }
-        val dropLeadingSpace = starterLetterInsertedSpace &&
-            AutoSpacingManager.classify(text) ==
-            AutoSpacingManager.CharacterClass.STICKY_PUNCTUATION
-        commitComposed(text, dropLeadingSpace)
+        markInserted(expected)
     }
 
     // ------------------------------------------------------------------ word tracking / T9
 
     private fun readTrailingWord(): String {
-        val connection = currentInputConnection ?: return ""
-        val before = connection.getTextBeforeCursor(WORD_LOOKBACK, 0)?.toString().orEmpty()
-        var start = before.length
-        while (start > 0 && before[start - 1].isLetter()) start--
-        return before.substring(start)
+        val connection = activeConnection() ?: return ""
+        return WordTokens.trailing(textBefore(connection, WORD_LOOKBACK))
     }
 
     /** Word and smart space that belong to the last gesture-typed insertion. */
@@ -655,10 +1236,13 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
 
     private fun currentSwipeContext(): SwipeContext? {
         val target = swipeWord ?: return null
-        val connection = currentInputConnection ?: return null
-        val before = connection.getTextBeforeCursor(SWIPE_LOOKBACK, 0)?.toString() ?: return null
-        var start = before.length
-        while (start > 0 && before[start - 1].isLetter()) start--
+        val connection = activeConnection() ?: return null
+        val before = try {
+            connection.getTextBeforeCursor(SWIPE_LOOKBACK, 0)?.toString()
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val start = WordTokens.trailingStart(before)
         if (start == before.length) return null
         val raw = before.substring(start)
         if (raw.length < 2 || !raw.equals(target, ignoreCase = true)) return null
@@ -667,16 +1251,43 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
     }
 
     private fun refreshWord() {
-        val raw = readTrailingWord()
-        if (raw == wordRaw) return
+        val context = readContext(WORD_CONTEXT_LOOKBACK)
+        if (context == null) {
+            updateWordState(readTrailingWord(), null)
+            return
+        }
+        val raw = trailingWord(context)
+        updateWordState(raw, wordBefore(context, raw))
+    }
+
+    private fun updateWordState(raw: String, previous: String?) {
+        if (raw == wordRaw && previous == currentPreviousWord) return
         wordRaw = raw
         currentWord = raw.lowercase(Locale.ROOT)
+        currentPreviousWord = previous
         updateSuggestions()
+    }
+
+    /** Trailing word before the cursor, including internal hyphens. */
+    private fun trailingWord(context: String): String = WordTokens.trailing(context)
+
+    /**
+     * Word directly before the current token; used as the bigram context. Returns null at the
+     * beginning of the field or when only punctuation precedes the cursor.
+     */
+    private fun wordBefore(context: String, current: String): String? =
+        WordTokens.before(context, current)
+
+    private fun readContext(maxChars: Int): String? = try {
+        activeConnection()?.getTextBeforeCursor(maxChars, 0)?.toString()
+    } catch (_: Exception) {
+        null
     }
 
     private fun clearWordState() {
         currentWord = ""
         wordRaw = ""
+        currentPreviousWord = null
         suggestionJob?.cancel()
         clearSwipeState()
         if (::keyboard.isInitialized) keyboard.suggestions = emptyList()
@@ -710,11 +1321,13 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
             return
         }
         val language = keyboard.russian
+        val previous = currentPreviousWord
         suggestionJob?.cancel()
         suggestionJob = scope.launch {
-            val result = prediction.suggestions(prefix, language)
+            val result = prediction.suggestions(prefix, language, previous)
             val swipePanel = swipeCandidates.isNotEmpty()
             if (::keyboard.isInitialized && currentWord == prefix &&
+                currentPreviousWord == previous &&
                 keyboard.russian == language && !keyboard.symbols && !swipePanel
             ) {
                 keyboard.suggestions = result
@@ -756,6 +1369,156 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
         handler.removeCallbacks(deleteTick)
     }
 
+    // ------------------------------------------------------------------ whole-field edits (AC, magic)
+
+    /** AC: clears the whole active field, keeping the cleared text as one undoable action. */
+    private fun clearAll() {
+        val connection = currentInputConnection ?: return
+        magicJob?.cancel()
+        magicJob = null
+        if (::keyboard.isInitialized && voice.state == VoiceInputController.State.IDLE) {
+            keyboard.showStatus(null)
+        }
+        val original = WholeFieldEditor.read(connection)
+        if (original == null) {
+            message(getString(R.string.err_clear_failed), true)
+            return
+        }
+        if (original.isEmpty()) return
+        if (!commitWholeFieldEdit(connection, original, "")) {
+            message(getString(R.string.err_clear_failed), true)
+        }
+    }
+
+    /** Replaces the whole field and records the replacement as one undoable action. */
+    private fun commitWholeFieldEdit(
+        connection: InputConnection,
+        original: String,
+        replacement: String
+    ): Boolean {
+        val spacingBefore = spacing.undoState()
+        val shiftBefore = oneShotShift
+        val capsBefore = caps
+        if (!WholeFieldEditor.replace(connection, original, replacement)) return false
+
+        spacing.reset()
+        clearWordState()
+        refreshAutoShiftFromContext()
+        editHistory.record(
+            EditHistory.Entry(
+                context = "",
+                removed = original,
+                inserted = replacement,
+                before = spacingBefore,
+                after = spacing.undoState(),
+                oneShotShiftBefore = shiftBefore,
+                capsBefore = capsBefore,
+                oneShotShiftAfter = oneShotShift,
+                capsAfter = caps
+            )
+        )
+        pendingLetterEntry = null
+        return true
+    }
+
+    /**
+     * Magic wand: reads the active field, asks DeepSeek for a light correction and puts the result
+     * back. The original text is one history entry, so the Back arrow restores it in one tap.
+     */
+    private fun fixTextWithMagic() {
+        if (voice.state != VoiceInputController.State.IDLE) return
+        if (magicJob?.isActive == true) return
+        val connection = currentInputConnection ?: return
+        val original = WholeFieldEditor.read(connection)
+        if (original == null) {
+            message(getString(R.string.err_magic_read_failed), true)
+            return
+        }
+        if (original.isBlank()) {
+            if (::keyboard.isInitialized) {
+                keyboard.showStatus(
+                    getString(R.string.status_magic_no_text),
+                    false,
+                    STATUS_MESSAGE_MILLIS
+                )
+            }
+            return
+        }
+        val apiKey = Prefs.deepseekKey(this)
+        if (apiKey.isEmpty()) {
+            message(getString(R.string.err_no_deepseek_key), true)
+            openSettings()
+            return
+        }
+        if (!::keyboard.isInitialized) return
+
+        keyboard.showStatus(getString(R.string.status_magic_running), false, 0L)
+        val session = inputSession
+        val model = Prefs.deepseekModel(this)
+        val prompt = getString(R.string.magic_prompt)
+        magicJob = scope.launch {
+            try {
+                val corrected = withContext(Dispatchers.IO) {
+                    SpeechApi.polish(original, apiKey, model, prompt, temperature = 0.0)
+                }.let { TextPolishPolicy.normalizeDashes(it) }
+
+                if (session != inputSession || !::keyboard.isInitialized) return@launch
+                val current = currentInputConnection
+                if (current == null) {
+                    if (voice.state == VoiceInputController.State.IDLE) keyboard.showStatus(null)
+                    return@launch
+                }
+                if (voice.state != VoiceInputController.State.IDLE) return@launch
+                if (corrected.isBlank()) {
+                    message(getString(R.string.err_magic_empty), true)
+                    return@launch
+                }
+                if (corrected == original) {
+                    keyboard.showStatus(
+                        getString(R.string.status_magic_unchanged),
+                        false,
+                        STATUS_MESSAGE_MILLIS
+                    )
+                    return@launch
+                }
+                if (!TextPolishPolicy.isLightEdit(original, corrected)) {
+                    message(getString(R.string.status_magic_rewritten), true)
+                    return@launch
+                }
+                val currentText = WholeFieldEditor.read(current)
+                if (currentText == null) {
+                    message(getString(R.string.err_magic_read_failed), true)
+                    return@launch
+                }
+                if (currentText != original) {
+                    keyboard.showStatus(
+                        getString(R.string.status_magic_changed),
+                        false,
+                        STATUS_MESSAGE_MILLIS
+                    )
+                    return@launch
+                }
+                if (!commitWholeFieldEdit(current, original, corrected)) {
+                    message(getString(R.string.err_magic_replace_failed), true)
+                    return@launch
+                }
+                keyboard.showStatus(
+                    getString(R.string.status_magic_done),
+                    false,
+                    STATUS_MESSAGE_MILLIS
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (session == inputSession && ::keyboard.isInitialized) {
+                    message(e.message ?: e.javaClass.simpleName, true)
+                }
+            } finally {
+                if (magicJob === coroutineContext[Job]) magicJob = null
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ voice status
 
     private fun voiceState(state: VoiceInputController.State) {
@@ -783,17 +1546,20 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
 
     private fun onVoiceCommitted() {
         consumeOneShotShift()
+        // Voice text is committed outside the keyboard history; starting a fresh history keeps
+        // undo from applying an older entry at the wrong cursor position.
+        editHistory.clear()
+        pendingLetterEntry = null
         clearWordState()
         spacing.reset()
-        val before = currentInputConnection?.getTextBeforeCursor(1, 0)?.toString()
-        if (before != null && AutoCapPolicy.endsSentence(before)) enableAutoShift()
+        refreshAutoShiftFromContext()
     }
 
     // ------------------------------------------------------------------ clipboard
 
     private fun readClipboard(): List<String> {
         rememberCurrentClipboard()
-        return clipboardHistory.toList()
+        return clipboardHistory.snapshot()
     }
 
     private fun rememberCurrentClipboard() {
@@ -807,11 +1573,7 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
     }
 
     private fun rememberClipboard(text: String) {
-        val value = text.trim()
-        if (value.isEmpty()) return
-        clipboardHistory.remove(value)
-        clipboardHistory.addFirst(value)
-        while (clipboardHistory.size > MAX_CLIPBOARD_HISTORY) clipboardHistory.removeLast()
+        clipboardHistory.remember(text)
     }
 
     // ------------------------------------------------------------------ system / window
@@ -884,13 +1646,19 @@ class VoiceKeyboardService : InputMethodService(), KeyboardCanvasView.Listener {
 
     private companion object {
         const val WORD_LOOKBACK = 48
+        const val WORD_CONTEXT_LOOKBACK = 80
         const val SWIPE_LOOKBACK = 64
+        const val HISTORY_CONTEXT = 24
+        const val AUTO_CAP_LOOKBACK = 64
         const val MAX_CLIPBOARD_HISTORY = 20
+        const val CLIPBOARD_HISTORY_FILE = "clipboard_history.txt"
         const val DOUBLE_TAP_MILLIS = 350L
         const val REPEAT_START_MILLIS = 350L
         const val WORD_DELETE_AFTER_MILLIS = 1_500L
         const val STATUS_MESSAGE_MILLIS = 2_600L
         const val SWIPE_BACKSPACE_WINDOW_MS = 5_000L
+        const val OWN_SELECTION_WINDOW_MS = 800L
+        const val MAX_SPACE_DRAG_STEPS = 40
 
         val TRAILING_WORD = Regex("\\s*\\S+\\s*$")
     }

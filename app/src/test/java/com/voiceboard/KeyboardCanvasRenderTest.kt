@@ -51,6 +51,10 @@ class KeyboardCanvasRenderTest {
             it.voiceActive = true
             it.showStatus("Идет запись 0:07", false, 0L)
         }
+        render("keyboard-magic") {
+            it.setLanguage(true)
+            it.showStatus("Правлю текст…", false, 0L)
+        }
         render("keyboard-shift") {
             it.setLanguage(true)
             it.setShift(true, false)
@@ -76,6 +80,19 @@ class KeyboardCanvasRenderTest {
             )
             it.toggleClipboard()
         }
+    }
+
+    @Test
+    fun renderNarrowPhoneToolbar() {
+        val view = KeyboardCanvasView(RuntimeEnvironment.getApplication())
+        view.setLanguage(true)
+        view.suggestions = listOf("привет", "приветик", "приветствие")
+        view.measure(
+            View.MeasureSpec.makeMeasureSpec(NARROW_WIDTH_PX, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(HEIGHT_PX, View.MeasureSpec.AT_MOST)
+        )
+        view.layout(0, 0, view.measuredWidth, view.measuredHeight)
+        draw(view, "keyboard-narrow")
     }
 
     @Test
@@ -131,6 +148,32 @@ class KeyboardCanvasRenderTest {
         assertEquals("space-start", log.first())
         assertEquals("space-end", log.last())
         assertTrue(log.any { it.startsWith("space-drag:") })
+    }
+
+    @Test
+    fun spaceDragContinuesOverTheLetterKeys() {
+        val view = createView()
+        val log = mutableListOf<String>()
+        view.listener = RecordingListener(log)
+        val space = view.keyMap.first { it.key.action == KeyboardCanvasView.Action.SPACE }
+        val letter = key(view, "Й")
+        val startX = space.center.x
+        val startY = space.center.y
+
+        down(view, startX, startY)
+        log.clear()
+        move(view, startX + 60f, startY)
+        // The finger leaves the spacebar and keeps moving above the letter row: the drag must stay
+        // attached to the space pointer instead of being cancelled halfway.
+        move(view, startX + 90f, letter.center.y)
+        move(view, startX + 130f, letter.center.y)
+        up(view, startX + 130f, letter.center.y)
+
+        assertEquals("space-start", log.first())
+        assertEquals("space-end", log.last())
+        assertTrue(
+            log.any { it.startsWith("space-drag:") && it.substringAfter(':').toFloat() >= 120f }
+        )
     }
 
     @Test
@@ -207,28 +250,98 @@ class KeyboardCanvasRenderTest {
     }
 
     @Test
-    fun lowercaseAndCapitalGlyphsShareVisualBounds() {
+    fun swipeStartingJustAboveTheTopRowIsStillRecognised() {
         val view = createView()
+        val listener = RecordingListener(mutableListOf())
+        view.listener = listener
+        val start = key(view, "К")
+        val next = key(view, "Е")
+        val end = key(view, "Н")
+        // Tap handling resolves a 1 px near-miss above the key; the swipe router must use the
+        // same resolver, otherwise only the starter letter is typed and the rest is ignored.
+        val y = start.rect.top - 1f
+
+        down(view, start.center.x, y)
+        move(view, next.center.x, next.center.y)
+        move(view, end.center.x, end.center.y)
+        up(view, end.center.x, end.center.y)
+
+        assertTrue("no swipe was produced from an edge hit", listener.lastGesture != null)
+    }
+
+    @Test
+    fun swipeStartingJustBelowTheBottomRowIsStillRecognised() {
+        val view = createView()
+        val listener = RecordingListener(mutableListOf())
+        view.listener = listener
+        val start = key(view, "М")
+        val next = key(view, "И")
+        val end = key(view, "Т")
+        val y = start.rect.bottom + 1f
+
+        down(view, start.center.x, y)
+        move(view, next.center.x, next.center.y)
+        move(view, end.center.x, end.center.y)
+        up(view, end.center.x, end.center.y)
+
+        assertTrue("no swipe was produced from an edge hit", listener.lastGesture != null)
+    }
+
+    @Test
+    fun greetingPhrasesEndWithAFullStop() {
+        val app = RuntimeEnvironment.getApplication()
+        assertEquals("привет.", app.getString(R.string.greeting_short))
+        assertEquals("добрый день.", app.getString(R.string.greeting_long))
+    }
+
+    @Test
+    fun capitalsAreLargerAndShiftedDown() {
+        val view = createView()
+        val density = view.resources.displayMetrics.density
+        val key = view.keyMap.first { it.key.label == "О" }
         for (letter in listOf('о', 'а', 'м')) {
             val lowercase = view.letterDrawBounds(false, letter)
             val capital = view.letterDrawBounds(true, letter)
+            val lowercaseBaseline = view.letterBaselineY(key.center.y, false)
+            val capitalBaseline = view.letterBaselineY(key.center.y, true)
+            val lowercaseTop = lowercaseBaseline + lowercase.top
+            val capitalTop = capitalBaseline + capital.top
             println(
-                "glyph $letter: capital ${capital.width()}x${capital.height()}, " +
-                    "lowercase ${lowercase.width()}x${lowercase.height()}"
+                "glyph $letter: capital ${capital.width() / density}x${capital.height() / density} " +
+                    "top=${capitalTop / density}, lowercase " +
+                    "${lowercase.width() / density}x${lowercase.height() / density} " +
+                    "top=${lowercaseTop / density}, baselines " +
+                    "${capitalBaseline / density}/${lowercaseBaseline / density}"
             )
-            assertEquals(
-                "height of $letter",
-                capital.height(),
-                lowercase.height(),
-                3f
+
+            assertTrue("capital $letter is taller", capital.height() > lowercase.height() + 2f * density)
+            assertTrue("capital $letter is wider", capital.width() > lowercase.width())
+            assertTrue("capital $letter sits lower", capitalBaseline > lowercaseBaseline + 2f * density)
+            assertTrue(
+                "capital $letter top stays clear of the secondary symbol",
+                capitalTop >= key.rect.top + 15f * density
             )
-            assertEquals(
-                "width of $letter",
-                capital.width(),
-                lowercase.width(),
-                3f
+            assertTrue(
+                "capital $letter does not grow above the lowercase glyph",
+                capitalTop >= lowercaseTop - 0.5f * density
+            )
+            assertTrue(
+                "capital $letter bottom stays inside the key",
+                capitalBaseline + capital.bottom <= key.rect.bottom - 6f * density
             )
         }
+    }
+
+    @Test
+    fun lowercaseBeKeepsItsFullUpperTail() {
+        val view = createView()
+        val density = view.resources.displayMetrics.density
+        val bounds = view.letterDrawBounds(false, 'б')
+
+        assertTrue(
+            "lowercase б should keep the tall ascender with its upper tail",
+            -bounds.top > 22f * density && bounds.height() > 22f * density
+        )
     }
 
     @Test
@@ -336,19 +449,102 @@ class KeyboardCanvasRenderTest {
         view.listener = RecordingListener(log)
         view.suggestions = listOf("привет", "приветик", "приветствие")
 
-        val x = 300f
-        val y = 60f
+        val slot = view.suggestionHitBounds(0)
+        val x = slot.centerX()
+        val y = slot.centerY()
         down(view, x, y)
         assertTrue(log.isEmpty())
         up(view, x, y)
         assertEquals(listOf("suggestion:привет"), log)
     }
 
+    @Test
+    @Config(qualifiers = "land-xxhdpi")
+    fun landscapePanelKeepsTheStripAboveTheToolbar() {
+        val view = createView()
+        val ac = view.toolbarHitBounds(KeyboardCanvasView.Action.AC)
+        val mic = view.toolbarHitBounds(KeyboardCanvasView.Action.MIC)
+        val slot = view.suggestionHitBounds(0)
+
+        assertTrue(slot.top >= 0f)
+        assertTrue(slot.bottom <= ac.top)
+        assertTrue(ac.bottom <= view.keyMap.first().rect.top)
+        assertTrue(mic.right <= view.measuredWidth)
+        assertTrue(view.measuredHeight > 0)
+        draw(view, "keyboard-landscape")
+    }
+
+    @Test
+    fun suggestionsUseTheFullStripAboveTheToolbar() {
+        val view = createView()
+        val density = RuntimeEnvironment.getApplication().resources.displayMetrics.density
+
+        val first = view.suggestionHitBounds(0)
+        val second = view.suggestionHitBounds(1)
+        val third = view.suggestionHitBounds(2)
+        assertEquals(6f * density, first.left, 0.5f)
+        assertEquals(view.measuredWidth - 6f * density, third.right, 0.5f)
+        assertEquals(first.right, second.left, 0.01f)
+        assertEquals(second.right, third.left, 0.01f)
+        // The strip sits above the toolbar, and the toolbar above the first key row.
+        assertEquals(first.bottom, view.toolbarHitBounds(KeyboardCanvasView.Action.AC).top, 0.01f)
+        assertTrue(first.bottom <= view.keyMap.first().rect.top)
+    }
+
+    @Test
+    fun toolbarButtonsAreEvenlySpacedWithSymmetricInsets() {
+        val view = createView()
+        val density = RuntimeEnvironment.getApplication().resources.displayMetrics.density
+        val edge = 10f * density
+        val order = listOf(
+            KeyboardCanvasView.Action.AC,
+            KeyboardCanvasView.Action.UNDO,
+            KeyboardCanvasView.Action.REDO,
+            KeyboardCanvasView.Action.CLIPBOARD,
+            KeyboardCanvasView.Action.MAGIC,
+            KeyboardCanvasView.Action.GREETING,
+            KeyboardCanvasView.Action.MIC
+        )
+        val bounds = order.map { view.toolbarHitBounds(it) }
+
+        // AC starts at the same inset the microphone ring leaves on the right edge.
+        assertEquals(edge, bounds.first().left, 0.5f)
+        assertEquals(view.measuredWidth - edge, bounds.last().right, 0.5f)
+        for (index in 1 until bounds.size) {
+            assertTrue(
+                "${order[index]} must be right of ${order[index - 1]}",
+                bounds[index].left > bounds[index - 1].right
+            )
+        }
+        val gaps = bounds.zipWithNext { left, right -> right.left - left.right }
+        for (gap in gaps) assertEquals(gaps.first(), gap, 0.5f)
+    }
+
+    @Test
+    fun greetingFiresOnTapAndLongPress() {
+        val view = createView()
+        val log = mutableListOf<String>()
+        view.listener = RecordingListener(log)
+        val bounds = view.toolbarHitBounds(KeyboardCanvasView.Action.GREETING)
+
+        down(view, bounds.centerX(), bounds.centerY())
+        log.clear()
+        up(view, bounds.centerX(), bounds.centerY())
+        assertEquals(listOf("action:GREETING"), log)
+
+        down(view, bounds.centerX(), bounds.centerY())
+        log.clear()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(400))
+        assertEquals(listOf("long:GREETING"), log)
+        up(view, bounds.centerX(), bounds.centerY())
+        assertEquals("tap action must not fire after a long press", listOf("long:GREETING"), log)
+    }
+
     private fun createView(): KeyboardCanvasView {
         val view = KeyboardCanvasView(RuntimeEnvironment.getApplication())
         view.measure(
             View.MeasureSpec.makeMeasureSpec(WIDTH_PX, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.AT_MOST)
+            View.MeasureSpec.makeMeasureSpec(HEIGHT_PX, View.MeasureSpec.AT_MOST)
         )
         view.layout(0, 0, view.measuredWidth, view.measuredHeight)
         return view
@@ -359,7 +555,7 @@ class KeyboardCanvasRenderTest {
         configure(view)
         view.measure(
             View.MeasureSpec.makeMeasureSpec(WIDTH_PX, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.AT_MOST)
+            View.MeasureSpec.makeMeasureSpec(HEIGHT_PX, View.MeasureSpec.AT_MOST)
         )
         view.layout(0, 0, view.measuredWidth, view.measuredHeight)
         draw(view, name)
@@ -445,12 +641,15 @@ class KeyboardCanvasRenderTest {
         }
 
         override fun onKeyAction(key: KeyboardCanvasView.Key) {
-            log.add("action:" + key.label)
+            log.add("action:" + keyName(key))
         }
 
         override fun onKeyLongPress(key: KeyboardCanvasView.Key) {
-            log.add("long:" + key.label)
+            log.add("long:" + keyName(key))
         }
+
+        private fun keyName(key: KeyboardCanvasView.Key): String =
+            if (key.label.isEmpty()) key.action.name else key.label
 
         override fun onKeyUp(key: KeyboardCanvasView.Key) {
             log.add("up:" + key.label)
@@ -501,5 +700,7 @@ class KeyboardCanvasRenderTest {
 
     private companion object {
         const val WIDTH_PX = 1225
+        const val NARROW_WIDTH_PX = 1080
+        const val HEIGHT_PX = 1400
     }
 }

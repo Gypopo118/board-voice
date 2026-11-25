@@ -123,10 +123,26 @@ class SwipeLexicon private constructor(
             return (a.code shl 16) or b.code
         }
 
+        /**
+         * Hyphens are allowed only inside a word. The layout has no key for them, so the decoder
+         * treats them as silent separators: a finger swiping «что-то» passes through the letters
+         * of both components.
+         */
         private fun usable(word: String): Boolean {
             if (word.length < 2 || word.length > MAX_WORD_LENGTH) return false
-            for (letter in word) if (!letter.isLetter()) return false
-            return true
+            var letters = 0
+            for (index in word.indices) {
+                val char = word[index]
+                if (char.isLetter()) {
+                    letters++
+                    continue
+                }
+                val internalHyphen = char == '-' &&
+                    index > 0 && index < word.lastIndex &&
+                    word[index - 1].isLetter() && word[index + 1].isLetter()
+                if (!internalHyphen) return false
+            }
+            return letters >= 2
         }
     }
 }
@@ -301,6 +317,8 @@ class SwipeEngine {
         var previous = '\u0000'
         for (raw in word) {
             var letter = raw.lowercaseChar()
+            // A hyphen has no key: the finger moves straight from one component to the next.
+            if (letter == '-') continue
             if (layout.russian && letter == 'ё') letter = 'е'
             val center = layout.letters[letter] ?: return -1
             if (letter == previous) continue
@@ -435,6 +453,7 @@ class SwipeEngine {
         var count = 0
         var previous = '\u0000'
         for (raw in word) {
+            if (raw == '-') continue
             val letter = normalizeLetter(raw.lowercaseChar(), russian)
             if (letter == previous) continue
             previous = letter
@@ -451,6 +470,7 @@ class SwipeEngine {
         var count = 0
         var previous = '\u0000'
         for (raw in word) {
+            if (raw == '-') continue
             val letter = normalizeLetter(raw.lowercaseChar(), russian)
             if (letter == previous) continue
             previous = letter
@@ -484,6 +504,7 @@ class SwipeEngine {
         var doubles = 0
         var previous = '\u0000'
         for (raw in word) {
+            if (raw == '-') continue
             var letter = raw.lowercaseChar()
             if (russian && letter == 'ё') letter = 'е'
             if (letter == previous) doubles++

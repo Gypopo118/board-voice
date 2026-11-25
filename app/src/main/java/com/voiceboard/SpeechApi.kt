@@ -63,13 +63,20 @@ object SpeechApi {
     }
 
     /**
-     * Sends the raw transcript through DeepSeek to fix punctuation and casing.
-     * Returns the cleaned text, or throws - the caller decides whether to fall back to the raw text.
+     * Sends text through DeepSeek to fix punctuation and casing. Returns the cleaned text, or
+     * throws - the caller decides whether to fall back to the raw text. A lower temperature makes
+     * the light-editing pass more deterministic.
      */
-    fun polish(text: String, apiKey: String, model: String, systemPrompt: String): String {
+    fun polish(
+        text: String,
+        apiKey: String,
+        model: String,
+        systemPrompt: String,
+        temperature: Double = 0.2
+    ): String {
         val payload = JSONObject()
             .put("model", model)
-            .put("temperature", 0.2)
+            .put("temperature", temperature)
             .put("stream", false)
             .put(
                 "messages", JSONArray()
@@ -92,11 +99,26 @@ object SpeechApi {
             .trim()
 
         if (content.isEmpty()) throw ApiException("DeepSeek: empty response")
-        // Models occasionally wrap the answer in quotes despite the prompt saying not to.
-        val cleaned = content.removeSurrounding("\"").removeSurrounding("«", "»").trim()
+        // Models occasionally wrap the answer in quotes despite the prompt saying not to. Keep
+        // the quotes when they are part of the author's text rather than a wrapper.
+        val cleaned = removeModelQuotes(content, text)
+        if (cleaned.isEmpty()) throw ApiException("DeepSeek: empty response")
 
         suspiciousReason(text, cleaned)?.let { throw ApiException(it) }
         return cleaned
+    }
+
+    private fun removeModelQuotes(value: String, original: String): String {
+        val text = value.trim()
+        val originalText = original.trim()
+        if (text.length < 2) return text
+        val pairs = listOf("\"" to "\"", "«" to "»", "\u201C" to "\u201D")
+        for ((open, close) in pairs) {
+            if (!text.startsWith(open) || !text.endsWith(close)) continue
+            if (originalText.startsWith(open) && originalText.endsWith(close)) return text
+            return text.substring(open.length, text.length - close.length).trim()
+        }
+        return text
     }
 
     /**
@@ -117,13 +139,8 @@ object SpeechApi {
             return "ответ похож на реплику модели, а не на правку текста"
         }
 
-        val hasMarkdown = "```" in polished ||
-            polished.lineSequence().any { it.trimStart().startsWith("#") } ||
-            polished.lineSequence().count { line ->
-                val t = line.trimStart()
-                t.startsWith("- ") || t.startsWith("* ") || Regex("""^\d+\.\s""").containsMatchIn(t)
-            } >= 2
-        if (hasMarkdown && "```" !in original && "#" !in original) {
+        val hasMarkdown = looksLikeMarkdown(polished)
+        if (hasMarkdown && !looksLikeMarkdown(original)) {
             return "ответ содержит разметку, которой не было в исходном тексте"
         }
 
@@ -143,6 +160,17 @@ object SpeechApi {
         }
 
         return null
+    }
+
+    /** Rough markdown detector used to reject formatting that the model invented. */
+    private fun looksLikeMarkdown(text: String): Boolean {
+        if ("```" in text) return true
+        if (text.lineSequence().any { it.trimStart().startsWith("#") }) return true
+        return text.lineSequence().count { line ->
+            val trimmed = line.trimStart()
+            trimmed.startsWith("- ") || trimmed.startsWith("* ") ||
+                Regex("""^\d+\.\s""").containsMatchIn(trimmed)
+        } >= 2
     }
 
     /** Cheap authenticated GET used by the settings screen to validate a key. */

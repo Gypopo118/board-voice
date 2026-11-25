@@ -78,15 +78,60 @@ class AutoCapPolicyTest {
     }
 
     @Test
-    fun deletionReturnsShiftAtFieldStartAndSentenceBoundaries() {
-        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion(null))
-        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion(""))
-        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("."))
-        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("!"))
-        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("?"))
-        assertTrue(AutoCapPolicy.shouldCapitalizeAfterDeletion("\n"))
-        assertFalse(AutoCapPolicy.shouldCapitalizeAfterDeletion("а"))
-        assertFalse(AutoCapPolicy.shouldCapitalizeAfterDeletion(" "))
-        assertFalse(AutoCapPolicy.shouldCapitalizeAfterDeletion(","))
+    fun sentenceContextLooksPastSpacesAndClosingPunctuation() {
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter(null))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter(""))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("."))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("!"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("?"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("\n"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter(" "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("привет. "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("привет!  "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("«Привет!» "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("Привет. «"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("«"))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("привет\n«"))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("а"))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("Привет «"))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("привет. Как"))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter(","))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("привет, "))
+    }
+
+    @Test
+    fun ellipsisEndsASentenceOnlyForTheGreeting() {
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("Ну… "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("Ну… ", ellipsisEndsSentence = true))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("Ну…", ellipsisEndsSentence = true))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("«Ну…» ", ellipsisEndsSentence = true))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("привет, ", ellipsisEndsSentence = true))
+    }
+
+    @Test
+    fun abbreviationsWithDotsDoNotStartNewSentences() {
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("т.д."))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("т.д. "))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("и т.д.  "))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("т.п. "))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("т.е. "))
+        assertFalse(AutoCapPolicy.shouldCapitalizeAfter("«т.д.» "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("привет. "))
+        assertTrue(AutoCapPolicy.shouldCapitalizeAfter("фт.д."))
+    }
+
+    @Test
+    fun abbreviationContinuationRecognisesOnlyTheInternalDot() {
+        assertTrue(AutoCapPolicy.isAbbreviationContinuation("т.", 'д'))
+        assertTrue(AutoCapPolicy.isAbbreviationContinuation("т.", 'п'))
+        assertTrue(AutoCapPolicy.isAbbreviationContinuation("т.", 'е'))
+        assertTrue(AutoCapPolicy.isAbbreviationContinuation("и т.", 'Д'))
+        assertTrue(AutoCapPolicy.isAbbreviationContinuation("Т.", 'д'))
+
+        assertFalse(AutoCapPolicy.isAbbreviationContinuation("т.", 'к'))
+        assertFalse(AutoCapPolicy.isAbbreviationContinuation("привет.", 'д'))
+        assertFalse(AutoCapPolicy.isAbbreviationContinuation("фт.", 'д'))
+        assertFalse(AutoCapPolicy.isAbbreviationContinuation("т.д.", 'с'))
+        assertFalse(AutoCapPolicy.isAbbreviationContinuation("т", 'д'))
     }
 }

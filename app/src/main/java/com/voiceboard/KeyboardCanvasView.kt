@@ -39,7 +39,10 @@ import kotlin.math.sqrt
  */
 class KeyboardCanvasView(context: Context) : View(context) {
 
-    enum class Action { LETTER, SHIFT, BACKSPACE, SPACE, SYMBOLS, LANGUAGE, ENTER, AC, CLIPBOARD, MIC, COMMA, PERIOD }
+    enum class Action {
+        LETTER, SHIFT, BACKSPACE, SPACE, SYMBOLS, LANGUAGE, ENTER,
+        AC, UNDO, REDO, CLIPBOARD, MAGIC, GREETING, MIC, COMMA, PERIOD
+    }
 
     data class Key(
         val label: String,
@@ -57,7 +60,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         /** Fired on touch-down for fast keys (letters, punctuation, backspace, shift). */
         fun onKeyDown(key: Key)
 
-        /** Fired on touch-up for deferred keys (space, enter, layout, clipboard, mic, AC). */
+        /** Fired on touch-up for deferred keys (space, enter, layout, AC, history, clipboard, mic). */
         fun onKeyAction(key: Key)
 
         fun onKeyLongPress(key: Key)
@@ -104,6 +107,18 @@ class KeyboardCanvasView(context: Context) : View(context) {
     /** Copy of the current cancel-recording hit target; exposed for tests and accessibility tools. */
     fun voiceCancelHitBounds(): RectF = RectF(voiceCancelHitRect)
 
+    /** Bounds of one suggestion slot; exposed for tests that tap the real layout. */
+    internal fun suggestionHitBounds(index: Int): RectF =
+        if (index in suggestionRects.indices) RectF(suggestionRects[index]) else RectF()
+
+    /** Bounds of one toolbar button; exposed for the layout tests. */
+    internal fun toolbarHitBounds(action: Action): RectF {
+        for (hit in toolbarHits) {
+            if (hit.key.action == action) return RectF(hit.rect)
+        }
+        return RectF()
+    }
+
     /** Number of points in all live swipe trails; exposed so the TTL can be tested. */
     internal fun activeTrailPointCount(): Int = trails.values.sumOf { it.size }
 
@@ -111,14 +126,14 @@ class KeyboardCanvasView(context: Context) : View(context) {
     internal fun activePressFadeCount(): Int = pressFadeStarts.size
 
     /**
-     * Bounds of the glyph exactly as [drawKey] would render it. Used by the typography test to
-     * verify that lowercase and capital letters have the same visual width and height.
+     * Bounds of the glyph exactly as [drawKey] would render it. Used by the typography tests to
+     * compare the lowercase and capital type scales.
      */
     internal fun letterDrawBounds(upperMode: Boolean, letter: Char): RectF {
         val paint = Paint(keyTextPaint)
-        paint.textSize = if (upperMode) letterMetricsPaint.textSize else lowercaseLetterTextSize
+        paint.textSize = if (upperMode) uppercaseLetterTextSize else lowercaseLetterTextSize
         paint.textScaleX = if (upperMode) 1f else lowercaseWidthScale(letter)
-        paint.typeface = if (upperMode) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        paint.typeface = Typeface.DEFAULT
         val text = if (upperMode) letter.uppercaseChar().toString() else letter.lowercaseChar().toString()
         val bounds = Rect()
         paint.getTextBounds(text, 0, text.length, bounds)
@@ -129,6 +144,10 @@ class KeyboardCanvasView(context: Context) : View(context) {
             bounds.bottom.toFloat()
         )
     }
+
+    /** Baseline used for a letter at [centerY]; capitals sit lower than lowercase. */
+    internal fun letterBaselineY(centerY: Float, upperMode: Boolean): Float =
+        if (upperMode) uppercaseLetterBaseline(centerY) else letterBaseline(centerY)
 
     var voiceActive = false
         set(value) {
@@ -155,10 +174,12 @@ class KeyboardCanvasView(context: Context) : View(context) {
     private var navigationInset = 0
     private var metrics = buildMetrics()
     private val keyHits = ArrayList<Hit>(64)
-    private val toolbarHits = ArrayList<Hit>(3)
+    private val toolbarHits = ArrayList<Hit>(8)
+    private val suggestionStripRect = RectF()
     private val suggestionRects = arrayOf(RectF(), RectF(), RectF())
     private var suggestionWords: List<String> = emptyList()
     private var suggestionLabels: List<String> = emptyList()
+    private var suggestionTextSizes: List<Float> = emptyList()
 
     private val pointerHits = HashMap<Int, Hit>()
     private val pressedHits = HashSet<Hit>()
@@ -212,7 +233,11 @@ class KeyboardCanvasView(context: Context) : View(context) {
     private val voiceCancelFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.argb(36, 255, 140, 0)
     }
-    private val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(70, 255, 107, 0) }
+    private val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(70, 255, 107, 0)
+        style = Paint.Style.STROKE
+        strokeWidth = dp(6f)
+    }
     private val scrollTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(40, 255, 255, 255) }
     private val scrollThumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(120, 255, 255, 255) }
     private val trailPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -244,15 +269,9 @@ class KeyboardCanvasView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         isSubpixelText = true
     }
-    private val beGlyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-        color = COLOR_TEXT
-    }
     /**
-     * Fixed metrics used to place every letter on the same baseline. Bold and regular glyphs can
-     * report slightly different font metrics, which would otherwise shift the Shift mode letters.
+     * Base font metrics for lowercase centring and for measuring the capital size/baseline
+     * difference. Capitals get their own larger size and a lower baseline.
      */
     private val letterMetricsPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = Typeface.DEFAULT
@@ -261,9 +280,10 @@ class KeyboardCanvasView(context: Context) : View(context) {
     }
 
     /**
-     * At the same text size lowercase glyphs have a much smaller x-height than capitals. The user
-     * asked for equal visual dimensions, so lowercase keeps its own shape but is scaled up until
-     * its x-height matches the cap height. The factor is measured from the actual system font.
+     * Lowercase is scaled up so its x-height matches the old capital size; this keeps the normal
+     * (Shift off) keyboard unchanged. Capitals get their own larger size and a lower baseline, so
+     * the extra height grows into the free space at the bottom instead of towards the secondary
+     * symbol in the top-right corner.
      */
     private val lowercaseLetterScale: Float = run {
         val probe = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -273,7 +293,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         }
         val capitalBounds = Rect()
         val lowercaseBounds = Rect()
-        probe.typeface = Typeface.DEFAULT_BOLD
+        probe.typeface = Typeface.DEFAULT
         probe.getTextBounds("О", 0, 1, capitalBounds)
         probe.typeface = Typeface.DEFAULT
         probe.getTextBounds("о", 0, 1, lowercaseBounds)
@@ -287,22 +307,48 @@ class KeyboardCanvasView(context: Context) : View(context) {
     private val lowercaseLetterTextSize: Float =
         letterMetricsPaint.textSize * lowercaseLetterScale
 
+    private val uppercaseLetterTextSize: Float =
+        letterMetricsPaint.textSize * UPPERCASE_LETTER_SCALE
+
+    /**
+     * Keeps the top of a capital at the same height as before while the larger font grows down.
+     * The extra dp adds a little more clearance below the superscript secondary symbols.
+     */
+    private val uppercaseBaselineShift: Float = run {
+        val probe = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            typeface = Typeface.DEFAULT
+            isSubpixelText = true
+        }
+        val baseBounds = Rect()
+        val uppercaseBounds = Rect()
+        probe.textSize = letterMetricsPaint.textSize
+        probe.getTextBounds("О", 0, 1, baseBounds)
+        probe.textSize = uppercaseLetterTextSize
+        probe.getTextBounds("О", 0, 1, uppercaseBounds)
+        max(0f, (uppercaseBounds.height() - baseBounds.height()).toFloat()) +
+            dp(UPPERCASE_EXTRA_SHIFT_DP)
+    }
+
     private val letterProbePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         typeface = Typeface.DEFAULT
         isSubpixelText = true
     }
     private val lowercaseWidthScales = HashMap<Char, Float>(40)
-    private val beCapHeight: Float by lazy { letterDrawBounds(true, 'б').height() }
     private val suggestionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = COLOR_TEXT
         textAlign = Paint.Align.CENTER
         textSize = dp(15f)
         isSubpixelText = true
     }
+    private val suggestionStripPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = COLOR_SUGGESTION_STRIP
+    }
     private val secondaryPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = COLOR_SECONDARY
+        // The superscript symbols are part of the key legend, not a muted hint: the same white
+        // as the primary letter keeps «:», «;» and «ё» readable at a glance.
+        color = COLOR_TEXT
         textAlign = Paint.Align.RIGHT
-        textSize = dp(11f)
+        textSize = dp(SECONDARY_TEXT_SIZE_DP)
         isSubpixelText = true
     }
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -511,24 +557,55 @@ class KeyboardCanvasView(context: Context) : View(context) {
         val side = dp(4f)
         val gap = dp(4f)
         val top = metrics.top
+        val toolbarTop = top + metrics.suggestion
 
-        val acRect = RectF(side, top, side + dp(58f), top + metrics.toolbar)
-        toolbarHits.add(Hit(Key("AC", action = Action.AC), acRect, PointF(acRect.centerX(), acRect.centerY())))
+        // Suggestions live on their own dark strip above the toolbar and use the whole width, so
+        // a long word no longer has to fit between the icon buttons and the microphone.
+        suggestionStripRect.set(0f, top, width.toFloat(), toolbarTop)
+        val suggestionSide = dp(6f)
+        val slotWidth = max(0f, (width - suggestionSide * 2f) / 3f)
+        for (index in 0 until 3) {
+            val left = suggestionSide + slotWidth * index
+            suggestionRects[index].set(left, top, left + slotWidth, toolbarTop)
+        }
 
-        val micSize = metrics.toolbar
-        val micRect = RectF(width - side - micSize, top, width - side, top + metrics.toolbar)
-        val clipRect = RectF(micRect.left - gap - micSize, top, micRect.left - gap, top + metrics.toolbar)
-        toolbarHits.add(Hit(Key("", action = Action.CLIPBOARD), clipRect, PointF(clipRect.centerX(), clipRect.centerY())))
+        // AC, the icon buttons and the microphone share the toolbar evenly: every pair is
+        // separated by the same gap, and AC starts at the same inset the microphone ring leaves
+        // on the right edge of the screen.
+        val edge = dp(10f)
+        val available = width - edge * 2f
+        val acWidth = dp(30f)
+        val micSize = if (metrics.toolbar >= dp(40f)) dp(42f) else metrics.toolbar - dp(2f)
+        val iconCount = TOOLBAR_ACTIONS.size
+        val gapCount = iconCount + 1
+        val minItemGap = dp(2f)
+        val iconSlot = min(
+            min(dp(36f), metrics.toolbar),
+            max(0f, (available - acWidth - micSize - minItemGap * gapCount) / iconCount)
+        )
+        val totalWidth = acWidth + iconSlot * iconCount + micSize
+        val itemGap = max(0f, (available - totalWidth) / gapCount)
+
+        var left = edge
+        val acRect = RectF(left, toolbarTop, left + acWidth, toolbarTop + metrics.toolbar)
+        toolbarHits.add(
+            Hit(Key("AC", action = Action.AC), acRect, PointF(acRect.centerX(), acRect.centerY()))
+        )
+        left += acWidth + itemGap
+        for (action in TOOLBAR_ACTIONS) {
+            val rect = RectF(left, toolbarTop, left + iconSlot, toolbarTop + metrics.toolbar)
+            toolbarHits.add(Hit(Key("", action = action), rect, PointF(rect.centerX(), rect.centerY())))
+            left += iconSlot + itemGap
+        }
+        val micRect = RectF(
+            left,
+            toolbarTop + (metrics.toolbar - micSize) / 2f,
+            left + micSize,
+            toolbarTop + (metrics.toolbar - micSize) / 2f + micSize
+        )
         toolbarHits.add(Hit(Key("", action = Action.MIC), micRect, PointF(micRect.centerX(), micRect.centerY())))
 
-        val suggestionLeft = acRect.right + gap
-        val suggestionRight = clipRect.left - gap
-        val slotWidth = (suggestionRight - suggestionLeft) / 3f
-        for (index in 0 until 3) {
-            val left = suggestionLeft + slotWidth * index
-            suggestionRects[index].set(left, top, left + slotWidth, top + metrics.toolbar)
-        }
-        var y = top + metrics.toolbar + metrics.gap
+        var y = toolbarTop + metrics.toolbar + metrics.gap
         for (row in buildRows()) {
             var totalWeight = 0f
             for (key in row) totalWeight += key.weight
@@ -544,7 +621,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         }
 
         buildSwipeLayout()
-        clipboardHeader.set(side, top, width - side, top + metrics.toolbar)
+        clipboardHeader.set(side, metrics.top, width - side, metrics.top + metrics.toolbar)
         clipboardViewport.set(side, clipboardHeader.bottom + metrics.gap, width - side, height - metrics.bottom)
         updateClipboardScrollBounds()
         buildSuggestionLabels()
@@ -577,15 +654,29 @@ class KeyboardCanvasView(context: Context) : View(context) {
         suggestionWords = words
         if (words.isEmpty() || suggestionRects[0].width() <= 0f) {
             suggestionLabels = emptyList()
+            suggestionTextSizes = emptyList()
             return
         }
-        val maxWidth = suggestionRects[0].width() - dp(12f)
-        suggestionLabels = words.map { fitSuggestion(it, maxWidth) }
+        val maxWidth = suggestionRects[0].width() - dp(6f)
+        val fitted = words.map { fitSuggestion(it, maxWidth) }
+        suggestionLabels = fitted.map { it.first }
+        suggestionTextSizes = fitted.map { it.second }
     }
 
-    private fun fitSuggestion(value: String, maxWidth: Float): String {
-        suggestionPaint.textSize = dp(15f)
-        if (suggestionPaint.measureText(value) <= maxWidth) return value
+    /**
+     * The undo/redo group leaves less width for suggestions, so long words shrink slightly before
+     * they are truncated. Returns the displayed text and the text size to use for it.
+     */
+    private fun fitSuggestion(value: String, maxWidth: Float): Pair<String, Float> {
+        val minimum = dp(10f)
+        var size = dp(15f)
+        while (size > minimum) {
+            suggestionPaint.textSize = size
+            if (suggestionPaint.measureText(value) <= maxWidth) return value to size
+            size -= dp(0.5f)
+        }
+        suggestionPaint.textSize = minimum
+        if (suggestionPaint.measureText(value) <= maxWidth) return value to minimum
         val ellipsis = "…"
         var end = value.length
         while (end > 1 &&
@@ -593,7 +684,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         ) {
             end--
         }
-        return value.substring(0, end) + ellipsis
+        return value.substring(0, end) + ellipsis to minimum
     }
 
     private fun updateClipboardScrollBounds() {
@@ -619,54 +710,103 @@ class KeyboardCanvasView(context: Context) : View(context) {
     }
 
     private fun drawToolbar(canvas: Canvas) {
-        val ac = toolbarHits[0]
-        val clip = toolbarHits[1]
-        val mic = toolbarHits[2]
+        // The suggestion strip is a separate band above the toolbar: its own dark surface, full
+        // screen width and nothing else competing for the space.
+        canvas.drawRect(suggestionStripRect, suggestionStripPaint)
+
+        val ac = toolbarHits[TOOL_AC]
+        val undo = toolbarHits[TOOL_UNDO]
+        val redo = toolbarHits[TOOL_REDO]
+        val clip = toolbarHits[TOOL_CLIPBOARD]
+        val magic = toolbarHits[TOOL_MAGIC]
+        val greeting = toolbarHits[TOOL_GREETING]
+        val mic = toolbarHits[TOOL_MIC]
 
         labelPaint.textAlign = Paint.Align.LEFT
         labelPaint.textSize = dp(17f)
-        labelPaint.color = if (pressedHits.contains(ac)) COLOR_MUTED else COLOR_TEXT
+        labelPaint.color = toolbarColor(ac)
         canvas.drawText(
             "AC",
-            ac.rect.left + dp(2f),
+            ac.rect.left,
             baseline(ac.center.y, labelPaint.textSize),
             labelPaint
         )
 
-        toolbarGlyphBounds(clip.rect, toolGlyphRect)
-        drawClipboardGlyph(
-            canvas,
-            toolGlyphRect,
-            if (pressedHits.contains(clip)) COLOR_MUTED else COLOR_TEXT
-        )
+        // Toolbar glyphs use a thinner stroke than the keyboard keys.
+        iconPaint.strokeWidth = dp(1.65f)
 
-        if (voiceActive) {
-            val fraction = (pulse?.animatedValue as? Float) ?: 0f
-            val alpha = (72 - 44 * fraction).toInt().coerceIn(0, 255)
-            haloPaint.color = Color.argb(alpha, 255, 107, 0)
-            canvas.drawCircle(mic.center.x, mic.center.y, dp(16f) + dp(6f) * fraction, haloPaint)
-        }
-        toolbarGlyphBounds(mic.rect, toolGlyphRect)
+        toolbarGlyphBounds(undo.rect, toolGlyphRect)
+        drawHistoryGlyph(canvas, toolGlyphRect, forward = false, toolbarColor(undo))
+
+        toolbarGlyphBounds(redo.rect, toolGlyphRect)
+        drawHistoryGlyph(canvas, toolGlyphRect, forward = true, toolbarColor(redo))
+
+        toolbarGlyphBounds(clip.rect, toolGlyphRect)
+        drawClipboardGlyph(canvas, toolGlyphRect, toolbarColor(clip))
+
+        toolbarGlyphBounds(magic.rect, toolGlyphRect)
+        drawMagicGlyph(canvas, toolGlyphRect, toolbarColor(magic))
+
+        toolbarGlyphBounds(greeting.rect, toolGlyphRect, WAVE_GLYPH_FRACTION)
+        drawWaveGlyph(canvas, toolGlyphRect, toolbarColor(greeting))
+
         val micColor = when {
             voiceActive -> COLOR_ACCENT
             pressedHits.contains(mic) -> COLOR_MUTED
             else -> COLOR_TEXT
         }
+        if (voiceActive) {
+            val fraction = (pulse?.animatedValue as? Float) ?: 0f
+            val alpha = (72 - 44 * fraction).toInt().coerceIn(0, 255)
+            haloPaint.color = Color.argb(alpha, 255, 107, 0)
+            canvas.drawCircle(
+                mic.center.x,
+                mic.center.y,
+                mic.rect.width() / 2f + dp(2f) + dp(2f) * fraction,
+                haloPaint
+            )
+        }
+        iconPaint.color = micColor
+        canvas.drawCircle(
+            mic.center.x,
+            mic.center.y,
+            mic.rect.width() / 2f - iconPaint.strokeWidth / 2f,
+            iconPaint
+        )
+        toolbarGlyphBounds(mic.rect, toolGlyphRect)
+        // Keep the microphone glyph the same visual size as the left-hand icons even though its
+        // circle is larger.
+        val iconSize = min(
+            undo.rect.width(),
+            undo.rect.height()
+        ) * TOOLBAR_GLYPH_FRACTION
+        toolGlyphRect.set(
+            mic.center.x - iconSize / 2f,
+            mic.center.y - iconSize / 2f,
+            mic.center.x + iconSize / 2f,
+            mic.center.y + iconSize / 2f
+        )
         drawMicGlyph(canvas, toolGlyphRect, micColor)
 
+        // Status/recording glyphs keep the original weight.
+        iconPaint.strokeWidth = dp(2f)
         if (statusText != null || voiceActive) drawStatus(canvas) else drawSuggestions(canvas)
     }
+
+    private fun toolbarColor(hit: Hit): Int =
+        if (pressedHits.contains(hit)) COLOR_MUTED else COLOR_TEXT
 
     private fun drawSuggestions(canvas: Canvas) {
         if (suggestionWords.isEmpty()) return
         suggestionPaint.textAlign = Paint.Align.CENTER
-        suggestionPaint.textSize = dp(15f)
         for (index in suggestionWords.indices) {
             val rect = suggestionRects[index]
             val label = if (index < suggestionLabels.size) suggestionLabels[index] else suggestionWords[index]
+            suggestionPaint.textSize =
+                if (index < suggestionTextSizes.size) suggestionTextSizes[index] else dp(15f)
             suggestionPaint.color = if (index == 0) COLOR_TEXT else COLOR_MUTED
             canvas.save()
-            canvas.clipRect(rect.left + dp(3f), rect.top, rect.right - dp(3f), rect.bottom)
+            canvas.clipRect(rect.left + dp(2f), rect.top, rect.right - dp(2f), rect.bottom)
             canvas.drawText(
                 label,
                 rect.centerX(),
@@ -693,6 +833,14 @@ class KeyboardCanvasView(context: Context) : View(context) {
             suggestionRects[0].left, suggestionRects[0].top,
             suggestionRects[2].right, suggestionRects[2].bottom
         )
+        // Longer statuses (DeepSeek failures, cancellation notices) get the whole strip, which is
+        // no longer shared with the toolbar icons.
+        val maxWidth = (statusRect.width() - dp(8f)).coerceAtLeast(1f)
+        var textSize = dp(14f)
+        while (textSize > dp(10f) && labelPaint.measureText(text) > maxWidth) {
+            textSize -= dp(0.5f)
+        }
+        labelPaint.textSize = textSize
         labelPaint.textAlign = Paint.Align.CENTER
         canvas.save()
         canvas.clipRect(
@@ -720,7 +868,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
             groupLeft + textWidth, suggestionRects[2].bottom
         )
         val iconLeft = groupLeft + textWidth + gap
-        val iconTop = suggestionRects[0].top + (metrics.toolbar - iconSize) / 2f
+        val iconTop = suggestionRects[0].top + (metrics.suggestion - iconSize) / 2f
         voiceCancelIconRect.set(iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize)
 
         val centerX = voiceCancelIconRect.centerX()
@@ -729,7 +877,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
             (centerX - hitHalf).coerceAtLeast(areaLeft),
             metrics.top,
             (centerX + hitHalf).coerceAtMost(areaRight),
-            metrics.top + metrics.toolbar
+            metrics.top + metrics.suggestion
         )
 
         labelPaint.textAlign = Paint.Align.LEFT
@@ -763,9 +911,10 @@ class KeyboardCanvasView(context: Context) : View(context) {
             canvas.drawRoundRect(rect, dp(8f), dp(8f), pressedPaint)
         }
 
-        val iconColor = if (key.action == Action.SHIFT && (shift || caps)) COLOR_ACCENT else COLOR_TEXT
         when (key.action) {
-            Action.SHIFT -> drawShiftGlyph(canvas, rect, iconColor)
+            // Uppercase mode has a solid arrow; lowercase only an outline with the key showing
+            // through. No accent colour: the fill itself signals the active state.
+            Action.SHIFT -> drawShiftGlyph(canvas, rect, COLOR_TEXT, filled = shift || caps)
             Action.BACKSPACE -> drawBackspaceGlyph(canvas, rect, COLOR_TEXT)
             Action.ENTER -> drawEnterGlyph(canvas, rect, COLOR_TEXT)
             Action.LANGUAGE -> drawGlobeGlyph(canvas, rect, COLOR_TEXT)
@@ -785,25 +934,27 @@ class KeyboardCanvasView(context: Context) : View(context) {
                     keyTextPaint.color = if (key.action == Action.SPACE) COLOR_MUTED else COLOR_TEXT
                     val labelBaseline: Float
                     if (letterKey || digitKey) {
-                        // Capitals use the nominal size; lowercase is scaled to the same visual
-                        // height (x-height = cap height) while keeping its own glyph shape. Digits
-                        // share the capital size so the keyboard has one visual type scale.
-                        keyTextPaint.textSize = if (letterKey && !upperMode) {
-                            lowercaseLetterTextSize
-                        } else {
-                            letterMetricsPaint.textSize
+                        // Lowercase keeps its normal, centred placement. Capitals use a larger
+                        // size and a lower baseline, so their growth goes into the free space at
+                        // the bottom of the key instead of covering the secondary symbol.
+                        keyTextPaint.textSize = when {
+                            letterKey && upperMode -> uppercaseLetterTextSize
+                            letterKey -> lowercaseLetterTextSize
+                            else -> letterMetricsPaint.textSize
                         }
                         keyTextPaint.textScaleX = if (letterKey && !upperMode) {
                             lowercaseWidthScale(label[0])
                         } else {
                             1f
                         }
-                        keyTextPaint.typeface = if (letterKey && upperMode) {
-                            Typeface.DEFAULT_BOLD
+                        // Capitals differ from lowercase by size and baseline, not by weight:
+                        // the larger glyph already reads as uppercase, so bold is unnecessary.
+                        keyTextPaint.typeface = Typeface.DEFAULT
+                        labelBaseline = if (letterKey && upperMode) {
+                            uppercaseLetterBaseline(rect.centerY())
                         } else {
-                            Typeface.DEFAULT
+                            letterBaseline(rect.centerY())
                         }
-                        labelBaseline = letterBaseline(rect.centerY())
                     } else {
                         keyTextPaint.typeface = Typeface.DEFAULT
                         keyTextPaint.textScaleX = 1f
@@ -814,24 +965,27 @@ class KeyboardCanvasView(context: Context) : View(context) {
                         }
                         labelBaseline = baseline(rect.centerY(), keyTextPaint.textSize)
                     }
-                    // Keep the larger letters clear of the superscript secondary symbol.
-                    val labelX = if (letterKey && key.secondary.isNotEmpty()) {
-                        rect.centerX() - dp(2f)
-                    } else {
-                        rect.centerX()
+                    // Keep the larger letters clear of the superscript secondary symbol. The
+                    // lowercase б has the tallest right-hand ascender, so it needs a little more
+                    // room than the other letters.
+                    val labelX = when {
+                        letterKey && !upperMode && label == "б" -> rect.centerX() - dp(5f)
+                        letterKey && key.secondary.isNotEmpty() -> rect.centerX() - dp(2f)
+                        else -> rect.centerX()
                     }
-                    if (letterKey && !upperMode && label == "б") {
-                        drawLowTopBe(canvas, labelX, labelBaseline, rect)
-                    } else {
-                        canvas.drawText(label, labelX, labelBaseline, keyTextPaint)
-                    }
+                    canvas.drawText(label, labelX, labelBaseline, keyTextPaint)
                 }
             }
         }
 
         if (key.secondary.isNotEmpty()) {
             secondaryPaint.textAlign = Paint.Align.RIGHT
-            canvas.drawText(key.secondary, rect.right - dp(7f), rect.top + dp(14f), secondaryPaint)
+            canvas.drawText(
+                key.secondary,
+                rect.right - dp(SECONDARY_RIGHT_INSET_DP),
+                rect.top + dp(SECONDARY_BASELINE_DP),
+                secondaryPaint
+            )
         }
     }
 
@@ -845,37 +999,6 @@ class KeyboardCanvasView(context: Context) : View(context) {
         if (!trailTickerRunning) return
         trailTickerRunning = false
         handler.removeCallbacks(trailTicker)
-    }
-
-    /**
-     * Lowercase `б` in the system font has a tall curved ascender that reaches the superscript
-     * `?` in the top-right corner of the key. This variant keeps the font's bowl/stem, clips the
-     * part above the cap line and replaces the hook with a low horizontal top stroke. Only this
-     * one Russian key uses it; all other letters stay on the normal font.
-     */
-    private fun drawLowTopBe(canvas: Canvas, centerX: Float, baseline: Float, keyRect: RectF) {
-        val textWidth = keyTextPaint.measureText("б")
-        if (textWidth <= 0f) return
-        val top = baseline - beCapHeight
-        val left = centerX - textWidth / 2f
-        val right = centerX + textWidth / 2f
-
-        canvas.save()
-        canvas.clipRect(keyRect.left, top, keyRect.right, keyRect.bottom)
-        canvas.drawText("б", centerX, baseline, keyTextPaint)
-        canvas.restore()
-
-        val stroke = dp(2f)
-        beGlyphPaint.color = keyTextPaint.color
-        beGlyphPaint.strokeWidth = stroke
-        val stemX = left + textWidth * 0.10f
-        canvas.drawLine(
-            stemX,
-            top + stroke / 2f,
-            right - stroke / 2f,
-            top + stroke / 2f,
-            beGlyphPaint
-        )
     }
 
     private fun startPressFade(hit: Hit) {
@@ -1070,15 +1193,179 @@ class KeyboardCanvasView(context: Context) : View(context) {
 
     // ------------------------------------------------------------------ vector glyphs
 
-    /** Shared square used by the mic and clipboard icons so their visual bounds match exactly. */
-    private fun toolbarGlyphBounds(slot: RectF, out: RectF) {
-        val size = min(slot.width(), slot.height()) * 0.60f
+    /** Shared square used by the toolbar icons so their visual bounds match exactly. */
+    private fun toolbarGlyphBounds(
+        slot: RectF,
+        out: RectF,
+        fraction: Float = TOOLBAR_GLYPH_FRACTION
+    ) {
+        val size = min(slot.width(), slot.height()) * fraction
         out.set(
             slot.centerX() - size / 2f,
             slot.centerY() - size / 2f,
             slot.centerX() + size / 2f,
             slot.centerY() + size / 2f
         )
+    }
+
+    /**
+     * Thin curved undo/redo arrow in the style of the reference panel: the arrowhead sits on the
+     * left, the tail curls down to the right. [forward] mirrors it for redo.
+     */
+    private fun drawHistoryGlyph(canvas: Canvas, rect: RectF, forward: Boolean, color: Int) {
+        val w = rect.width()
+        val h = rect.height()
+        val midX = rect.left + w * 0.40f
+        val midY = rect.top + h * 0.30f
+        iconPath.rewind()
+        iconPath.moveTo(midX, midY)
+        iconPath.cubicTo(
+            rect.left + w * 0.78f, rect.top + h * 0.12f,
+            rect.right - w * 0.02f, rect.top + h * 0.56f,
+            rect.left + w * 0.52f, rect.top + h * 0.86f
+        )
+        val tipX = rect.left + w * 0.13f
+        iconPath.moveTo(tipX, midY)
+        iconPath.lineTo(midX, midY - h * 0.20f)
+        iconPath.moveTo(tipX, midY)
+        iconPath.lineTo(midX, midY + h * 0.20f)
+        iconPaint.color = color
+        canvas.save()
+        if (forward) {
+            canvas.translate(rect.left + rect.right, 0f)
+            canvas.scale(-1f, 1f)
+        }
+        canvas.drawPath(iconPath, iconPaint)
+        canvas.restore()
+    }
+
+    /** Light clipboard outline: rounded body, small top tab, three thin content lines. */
+    private fun drawClipboardGlyph(canvas: Canvas, rect: RectF, color: Int) {
+        val w = rect.width()
+        val h = rect.height()
+        val cx = rect.centerX()
+        val inset = iconPaint.strokeWidth / 2f
+        val bodyWidth = w * 0.62f
+        val left = cx - bodyWidth / 2f
+        val right = cx + bodyWidth / 2f
+        val bodyTop = rect.top + h * 0.17f
+        val bodyBottom = rect.bottom - inset
+
+        iconPath.rewind()
+        iconRect.set(left, bodyTop, right, bodyBottom)
+        iconPath.addRoundRect(iconRect, dp(2.5f), dp(2.5f), Path.Direction.CW)
+        val tabWidth = w * 0.34f
+        iconRect.set(
+            cx - tabWidth / 2f, rect.top + inset,
+            cx + tabWidth / 2f, rect.top + h * 0.25f
+        )
+        iconPath.addRoundRect(iconRect, dp(1.8f), dp(1.8f), Path.Direction.CW)
+        val lineLeft = left + bodyWidth * 0.20f
+        val lineRight = right - bodyWidth * 0.20f
+        val lineTop = bodyTop + (bodyBottom - bodyTop) * 0.31f
+        val lineSpan = (bodyBottom - bodyTop) * 0.38f
+        for (index in 0..2) {
+            val y = lineTop + lineSpan * index / 2f
+            iconPath.moveTo(lineLeft, y)
+            iconPath.lineTo(lineRight, y)
+        }
+        iconPaint.color = color
+        canvas.drawPath(iconPath, iconPaint)
+    }
+
+    /** Magic wand with a sparkle at the tip; the edit action behind it is not wired up yet. */
+    private fun drawMagicGlyph(canvas: Canvas, rect: RectF, color: Int) {
+        val w = rect.width()
+        val h = rect.height()
+        iconPath.rewind()
+        iconPath.moveTo(rect.left + w * 0.15f, rect.bottom - h * 0.08f)
+        iconPath.lineTo(rect.left + w * 0.65f, rect.top + h * 0.37f)
+        iconPaint.color = color
+        canvas.drawPath(iconPath, iconPaint)
+
+        iconPath.rewind()
+        addSparkle(
+            iconPath,
+            rect.left + w * 0.78f,
+            rect.top + h * 0.22f,
+            w * 0.17f
+        )
+        iconFillPaint.color = color
+        canvas.drawPath(iconPath, iconFillPaint)
+
+        iconPath.rewind()
+        addSparkle(iconPath, rect.left + w * 0.34f, rect.top + h * 0.16f, w * 0.075f)
+        addSparkle(iconPath, rect.right - w * 0.03f, rect.top + h * 0.62f, w * 0.055f)
+        canvas.drawPath(iconPath, iconFillPaint)
+    }
+
+    /** Four-point star with slightly concave sides, used for the wand sparkles. */
+    private fun addSparkle(path: Path, cx: Float, cy: Float, radius: Float) {
+        val inner = radius * 0.30f
+        path.moveTo(cx, cy - radius)
+        path.quadTo(cx + inner, cy - inner, cx + radius, cy)
+        path.quadTo(cx + inner, cy + inner, cx, cy + radius)
+        path.quadTo(cx - inner, cy + inner, cx - radius, cy)
+        path.quadTo(cx - inner, cy - inner, cx, cy - radius)
+        path.close()
+    }
+
+    /**
+     * Waving palm for the greeting button: an open hand with four rounded fingers and a thumb on
+     * the right, plus two motion arcs on each side. Drawn from the supplied reference icon. The
+     * stroke is thinner than the other toolbar glyphs: four finger outlines do not survive the
+     * shared 1.65 dp weight at a 19 dp glyph size.
+     */
+    private fun drawWaveGlyph(canvas: Canvas, rect: RectF, color: Int) {
+        val w = rect.width()
+        val h = rect.height()
+        fun x(value: Float): Float = rect.left + w * value
+        fun y(value: Float): Float = rect.top + h * value
+
+        val previousStroke = iconPaint.strokeWidth
+        iconPaint.strokeWidth = dp(1.2f)
+        iconPaint.color = color
+        iconPath.rewind()
+        // Left edge of the palm, then the pinky with its rounded tip and the first valley.
+        iconPath.moveTo(x(0.40f), y(0.90f))
+        iconPath.cubicTo(x(0.33f), y(0.87f), x(0.30f), y(0.79f), x(0.30f), y(0.70f))
+        iconPath.cubicTo(x(0.29f), y(0.63f), x(0.27f), y(0.55f), x(0.27f), y(0.50f))
+        iconPath.cubicTo(x(0.27f), y(0.43f), x(0.33f), y(0.41f), x(0.35f), y(0.46f))
+        iconPath.cubicTo(x(0.36f), y(0.50f), x(0.37f), y(0.54f), x(0.38f), y(0.57f))
+        // Ring finger.
+        iconPath.cubicTo(x(0.37f), y(0.50f), x(0.36f), y(0.38f), x(0.36f), y(0.32f))
+        iconPath.cubicTo(x(0.36f), y(0.25f), x(0.44f), y(0.24f), x(0.45f), y(0.32f))
+        iconPath.cubicTo(x(0.46f), y(0.39f), x(0.46f), y(0.49f), x(0.47f), y(0.56f))
+        // Middle finger, the tallest one.
+        iconPath.cubicTo(x(0.47f), y(0.44f), x(0.46f), y(0.28f), x(0.47f), y(0.22f))
+        iconPath.cubicTo(x(0.48f), y(0.14f), x(0.56f), y(0.15f), x(0.56f), y(0.23f))
+        iconPath.cubicTo(x(0.56f), y(0.34f), x(0.56f), y(0.47f), x(0.57f), y(0.55f))
+        // Index finger.
+        iconPath.cubicTo(x(0.58f), y(0.45f), x(0.58f), y(0.33f), x(0.59f), y(0.28f))
+        iconPath.cubicTo(x(0.59f), y(0.21f), x(0.67f), y(0.22f), x(0.67f), y(0.29f))
+        iconPath.cubicTo(x(0.67f), y(0.39f), x(0.66f), y(0.50f), x(0.66f), y(0.56f))
+        // Thumb: a short rounded loop on the right side of the palm.
+        iconPath.cubicTo(x(0.71f), y(0.53f), x(0.76f), y(0.49f), x(0.79f), y(0.46f))
+        iconPath.cubicTo(x(0.83f), y(0.43f), x(0.87f), y(0.48f), x(0.83f), y(0.53f))
+        iconPath.cubicTo(x(0.79f), y(0.58f), x(0.75f), y(0.61f), x(0.71f), y(0.65f))
+        // Right edge of the palm and the rounded wrist.
+        iconPath.cubicTo(x(0.70f), y(0.73f), x(0.69f), y(0.82f), x(0.68f), y(0.89f))
+        iconPath.cubicTo(x(0.62f), y(0.94f), x(0.47f), y(0.95f), x(0.40f), y(0.90f))
+        iconPath.close()
+        canvas.drawPath(iconPath, iconPaint)
+
+        // Motion arcs, two on each side of the hand.
+        iconPath.rewind()
+        iconPath.moveTo(x(0.20f), y(0.53f))
+        iconPath.quadTo(x(0.10f), y(0.60f), x(0.17f), y(0.72f))
+        iconPath.moveTo(x(0.13f), y(0.48f))
+        iconPath.quadTo(x(0.02f), y(0.56f), x(0.09f), y(0.75f))
+        iconPath.moveTo(x(0.80f), y(0.18f))
+        iconPath.quadTo(x(0.90f), y(0.24f), x(0.85f), y(0.35f))
+        iconPath.moveTo(x(0.85f), y(0.12f))
+        iconPath.quadTo(x(0.95f), y(0.19f), x(0.90f), y(0.31f))
+        canvas.drawPath(iconPath, iconPaint)
+        iconPaint.strokeWidth = previousStroke
     }
 
     private fun drawVoiceCancelGlyph(canvas: Canvas) {
@@ -1141,39 +1428,6 @@ class KeyboardCanvasView(context: Context) : View(context) {
         canvas.drawRoundRect(iconRect, h * 0.015f, h * 0.015f, iconFillPaint)
     }
 
-    private fun drawClipboardGlyph(canvas: Canvas, rect: RectF, color: Int) {
-        val w = rect.width()
-        val h = rect.height()
-        val cx = rect.centerX()
-        val inset = iconPaint.strokeWidth / 2f
-        val bodyWidth = w * 0.60f
-        val left = cx - bodyWidth / 2f
-        val right = cx + bodyWidth / 2f
-        val bodyTop = rect.top + h * 0.12f
-        val bodyBottom = rect.bottom - inset
-
-        iconPath.rewind()
-        iconRect.set(left, bodyTop, right, bodyBottom)
-        iconPath.addRoundRect(iconRect, dp(3f), dp(3f), Path.Direction.CW)
-        val tabWidth = w * 0.34f
-        iconRect.set(
-            cx - tabWidth / 2f, rect.top + inset,
-            cx + tabWidth / 2f, rect.top + h * 0.24f
-        )
-        iconPath.addRoundRect(iconRect, dp(2f), dp(2f), Path.Direction.CW)
-        val lineLeft = left + bodyWidth * 0.18f
-        val lineRight = right - bodyWidth * 0.18f
-        val lineTop = bodyTop + (bodyBottom - bodyTop) * 0.24f
-        val lineSpan = (bodyBottom - bodyTop) * 0.52f
-        for (index in 0..2) {
-            val y = lineTop + lineSpan * index / 2f
-            iconPath.moveTo(lineLeft, y)
-            iconPath.lineTo(lineRight, y)
-        }
-        iconPaint.color = color
-        canvas.drawPath(iconPath, iconPaint)
-    }
-
     private fun drawGlobeGlyph(canvas: Canvas, rect: RectF, color: Int) {
         val w = rect.width()
         val h = rect.height()
@@ -1226,7 +1480,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
         canvas.drawPath(iconPath, iconPaint)
     }
 
-    private fun drawShiftGlyph(canvas: Canvas, rect: RectF, color: Int) {
+    private fun drawShiftGlyph(canvas: Canvas, rect: RectF, color: Int, filled: Boolean) {
         val w = rect.width()
         val h = rect.height()
         val top = rect.top + h * 0.24f
@@ -1241,8 +1495,14 @@ class KeyboardCanvasView(context: Context) : View(context) {
         iconPath.lineTo(rect.left + w * 0.41f, mid)
         iconPath.lineTo(rect.left + w * 0.27f, mid)
         iconPath.close()
-        iconFillPaint.color = color
-        canvas.drawPath(iconPath, iconFillPaint)
+        if (filled) {
+            iconFillPaint.color = color
+            canvas.drawPath(iconPath, iconFillPaint)
+        } else {
+            iconPaint.color = color
+            iconPaint.strokeWidth = dp(2f)
+            canvas.drawPath(iconPath, iconPaint)
+        }
     }
 
     // ------------------------------------------------------------------ touch
@@ -1254,7 +1514,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
             event,
             if (allowSwipe) keyHits else emptyList(),
             if (allowSwipe) swipeLayout else null,
-            touchSlop
+            touchSlop,
+            ::hitKeyAt
         )
         if (clipboardOpen) {
             handleClipboardTouch(event)
@@ -1447,7 +1708,8 @@ class KeyboardCanvasView(context: Context) : View(context) {
         val needsLongPress = key.secondary.isNotEmpty() ||
             key.action == Action.BACKSPACE ||
             key.action == Action.AC ||
-            key.action == Action.LANGUAGE
+            key.action == Action.LANGUAGE ||
+            key.action == Action.GREETING
         if (!needsLongPress) return
 
         val task = Runnable {
@@ -1471,6 +1733,9 @@ class KeyboardCanvasView(context: Context) : View(context) {
         longPressTasks[pointerId] = task
         handler.postDelayed(task, LONG_PRESS_MILLIS)
     }
+
+    /** Key under a touch-down point, using the same near-miss mapping as tap handling. */
+    private fun hitKeyAt(x: Float, y: Float): Key? = hitAt(x, y)?.key
 
     private fun hitAt(x: Float, y: Float): Hit? {
         for (index in 0 until toolbarHits.size) {
@@ -1643,12 +1908,12 @@ class KeyboardCanvasView(context: Context) : View(context) {
         val bottom = navigationInset.toFloat()
         return if (landscape) {
             Metrics(
-                3f * density, 34f * density, 4f * density,
+                3f * density, 28f * density, 34f * density, 4f * density,
                 34f * density, 3f * density, 3f * density + bottom
             )
         } else {
             Metrics(
-                5f * density, 44f * density, 5f * density,
+                5f * density, 36f * density, 44f * density, 5f * density,
                 50f * density, 4f * density, 5f * density + bottom
             )
         }
@@ -1657,26 +1922,30 @@ class KeyboardCanvasView(context: Context) : View(context) {
     private fun baseline(centerY: Float, textSize: Float): Float = centerY + textSize * 0.35f
 
     /**
-     * Centres the font box (ascent + descent) rather than relying on a fraction of the text size.
-     * This keeps lowercase letters with ascenders/descenders (`б`, `р`, `у`, `д`, `g`, `p`, `y`)
-     * inside the key and on the same optical line as the capitalised Shift glyphs.
+     * Lowercase letters are centred on the key using the font box (ascent + descent). This keeps
+     * letters with ascenders/descenders (`б`, `р`, `у`, `д`, `g`, `p`, `y`) on the same optical
+     * line as the rest of the lowercase row.
      */
     private fun letterBaseline(centerY: Float): Float {
         val metrics = letterMetricsPaint.fontMetrics
         return centerY - (metrics.ascent + metrics.descent) / 2f
     }
 
+    /** Capitals keep the same top edge as before while their larger body grows downwards. */
+    private fun uppercaseLetterBaseline(centerY: Float): Float =
+        letterBaseline(centerY) + uppercaseBaselineShift
+
     /**
      * Horizontal correction per lowercase glyph: the scaled lowercase keeps its own shape, but its
-     * bounding width is matched to the bold capital of the same letter. Results are cached because
-     * this runs during onDraw.
+     * bounding width is matched to the regular capital glyph at the base size. Results are cached
+     * because this runs during onDraw.
      */
     private fun lowercaseWidthScale(letter: Char): Float {
         lowercaseWidthScales[letter]?.let { return it }
         val capital = letter.uppercaseChar()
         val capitalBounds = Rect()
         val lowercaseBounds = Rect()
-        letterProbePaint.typeface = Typeface.DEFAULT_BOLD
+        letterProbePaint.typeface = Typeface.DEFAULT
         letterProbePaint.textSize = letterMetricsPaint.textSize
         letterProbePaint.getTextBounds(capital.toString(), 0, 1, capitalBounds)
         letterProbePaint.typeface = Typeface.DEFAULT
@@ -1757,6 +2026,7 @@ class KeyboardCanvasView(context: Context) : View(context) {
 
     private class Metrics(
         val top: Float,
+        val suggestion: Float,
         val toolbar: Float,
         val gap: Float,
         val keyHeight: Float,
@@ -1764,11 +2034,18 @@ class KeyboardCanvasView(context: Context) : View(context) {
         val bottom: Float
     ) {
         fun height(rows: Int): Float =
-            top + toolbar + gap + rows * keyHeight + (rows - 1) * rowGap + bottom
+            top + suggestion + toolbar + gap + rows * keyHeight + (rows - 1) * rowGap + bottom
     }
 
     private companion object {
         const val ROW_COUNT = 5
+        const val TOOL_AC = 0
+        const val TOOL_UNDO = 1
+        const val TOOL_REDO = 2
+        const val TOOL_CLIPBOARD = 3
+        const val TOOL_MAGIC = 4
+        const val TOOL_GREETING = 5
+        const val TOOL_MIC = 6
         const val MAX_CLIPBOARD_ITEMS = 20
         const val CLIPBOARD_ROW_STEP_DP = 46f
         const val CLIPBOARD_ROW_HEIGHT_DP = 40f
@@ -1779,10 +2056,25 @@ class KeyboardCanvasView(context: Context) : View(context) {
         const val TRAIL_FADE_MILLIS = 220L
         const val PRESS_FADE_MILLIS = 180L
         const val PRESS_FADE_FRAME_MILLIS = 16L
-        // Lower and upper case share one text size; Shift only changes case and weight.
+        // Lowercase keeps the base text size; capitals use their own larger scale.
         const val LETTER_TEXT_SIZE_DP = 24.5f
+        const val UPPERCASE_LETTER_SCALE = 1.18f
+        const val UPPERCASE_EXTRA_SHIFT_DP = 1f
+        // Superscript secondary symbols: white, a little larger than before and tucked into the
+        // top-right corner so «:», «;» and other thin glyphs stay legible.
+        const val SECONDARY_TEXT_SIZE_DP = 12f
+        const val SECONDARY_RIGHT_INSET_DP = 5f
+        const val SECONDARY_BASELINE_DP = 13f
+        const val TOOLBAR_GLYPH_FRACTION = 0.54f
+        // The waving palm carries more detail than the other icons, so it gets a little more room.
+        const val WAVE_GLYPH_FRACTION = 0.70f
+
+        val TOOLBAR_ACTIONS = listOf(
+            Action.UNDO, Action.REDO, Action.CLIPBOARD, Action.MAGIC, Action.GREETING
+        )
 
         val COLOR_BACKGROUND = Color.rgb(28, 28, 30)
+        val COLOR_SUGGESTION_STRIP = Color.rgb(32, 32, 34)
         val COLOR_KEY = Color.rgb(44, 44, 46)
         val COLOR_FUNCTION = Color.rgb(36, 36, 38)
         val COLOR_PRESSED = Color.rgb(78, 78, 82)
